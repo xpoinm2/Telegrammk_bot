@@ -1,20 +1,4 @@
 {
-  "+639122349538": {
-    "phone": "+639122349538",
-    "api_id": 24266525,
-    "device": "iPhone 13 Pro",
-    "session_file": "sessions\\+639122349538.session",
-    "proxy_dynamic": true,
-    "proxy_desc": "HTTP://185.162.130.86:10000"
-  },
-  "+63 912 234 9538": {
-    "phone": "+63 912 234 9538",
-    "api_id": 20149796,
-    "device": "iPhone SE (2nd)",
-    "session_file": "sessions\\+63 912 234 9538.session",
-    "proxy_dynamic": true,
-    "proxy_desc": "HTTP://185.162.130.86:10000"
-  },
   "+1 315 988 2195": {
     "phone": "+1 315 988 2195",
     "api_id": 29762521,

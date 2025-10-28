@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import json
 import logging
@@ -13,6 +14,15 @@ from telethon.errors import (
     SessionPasswordNeededError,
     FloodWaitError,
 )
+try:  # Telethon <= 1.33.1
+    from telethon.errors import AuthKeyDuplicatedError  # type: ignore[attr-defined]
+except ImportError:  # Telethon >= 1.34
+    try:
+        from telethon.errors.rpcerrorlist import AuthKeyDuplicatedError  # type: ignore[attr-defined]
+    except ImportError:  # pragma: no cover - fallback safety
+        class AuthKeyDuplicatedError(RuntimeError):  # type: ignore[override]
+            """Fallback placeholder when Telethon is missing the error."""
+            pass
 
 try:  # Telethon <= 1.33.1
     from telethon.errors import PhoneCodeFloodError  # type: ignore[attr-defined]
@@ -234,6 +244,51 @@ class AccountWorker:
         self.started = False
         self._keepalive_task: Optional[asyncio.Task] = None
 
+    def _reset_session_state(self) -> None:
+        with contextlib.suppress(FileNotFoundError):
+            os.remove(self.session_file)
+        self.session = StringSession()
+
+    def _set_session_invalid_flag(self, invalid: bool) -> None:
+        meta = accounts_meta.get(self.phone)
+        if not meta:
+            return
+        changed = False
+        if invalid:
+            if not meta.get("session_invalid"):
+                meta["session_invalid"] = True
+                changed = True
+        else:
+            if meta.pop("session_invalid", None) is not None:
+                changed = True
+        if changed:
+            _save(accounts_meta, ACCOUNTS_META)
+
+    async def _handle_authkey_duplication(self, error: Exception) -> None:
+        log.warning(
+            "[%s] session revoked by Telegram due to IP mismatch: %s",
+            self.phone,
+            error,
+        )
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+        self._keepalive_task = None
+        if self.client:
+            with contextlib.suppress(Exception):
+                await self.client.disconnect()
+        self.client = None
+        self.started = False
+        self._reset_session_state()
+        self._set_session_invalid_flag(True)
+        WORKERS.pop(self.phone, None)
+        await safe_send_admin(
+            (
+                f"⚠️ <b>{self.phone}</b>: Telegram аннулировал сессию из-за одновременного"
+                " входа с разных IP. Добавь аккаунт заново, чтобы получить новую сессию."
+            ),
+            parse_mode="html",
+        )
+
     def _make_client(self) -> TelegramClient:
         return TelegramClient(
             self.session, self.api_id, self.api_hash,
@@ -252,48 +307,54 @@ class AccountWorker:
         return self.client
 
     async def start(self):
-        self.client = await self._ensure_client()
-        if not await self.client.is_user_authorized():
-            return
+        try:
+            self.client = await self._ensure_client()
+            if not await self.client.is_user_authorized():
+                return
 
-        @self.client.on(events.NewMessage(incoming=True))
-        async def on_new(ev):
-            txt = ev.raw_text or "<media>"
-            ctx_id = secrets.token_hex(4)
-            peer = None
-            try:
-                peer = await ev.get_input_chat()
-            except Exception:
+            @self.client.on(events.NewMessage(incoming=True))
+            async def on_new(ev):
+                txt = ev.raw_text or "<media>"
+                ctx_id = secrets.token_hex(4)
+                peer = None
                 try:
-                    peer = await ev.get_input_sender()
+                    peer = await ev.get_input_chat()
                 except Exception:
-                    peer = None
-            reply_contexts[ctx_id] = {
-                "phone": self.phone,
-                "chat_id": ev.chat_id,
-                "sender_id": ev.sender_id,
-                "peer": peer,
-                "msg_id": ev.id,
-            }          
-            msg = (f"📥 <b>{self.phone}</b>\n"
-                   f"proxy: <code>{proxy_desc(build_dynamic_proxy_tuple())}</code>\n"
-                   f"chat_id: <code>{ev.chat_id}</code>\n"
-                   f"sender_id: <code>{ev.sender_id}</code>\n\n{txt}")
-            await safe_send_admin(
-                msg,
-                parse_mode="html",
-                buttons=[[
-                    Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
-                    Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
-                    Button.inline("📄 Пасты", f"paste_menu:{ctx_id}".encode()),
-                    Button.inline("🎙 Голосовые", f"voice_menu:{ctx_id}".encode()),
-                ]]
-            )
+                    try:
+                        peer = await ev.get_input_sender()
+                    except Exception:
+                        peer = None
+                reply_contexts[ctx_id] = {
+                    "phone": self.phone,
+                    "chat_id": ev.chat_id,
+                    "sender_id": ev.sender_id,
+                    "peer": peer,
+                    "msg_id": ev.id,
+                }
+                msg = (f"📥 <b>{self.phone}</b>\n"
+                       f"proxy: <code>{proxy_desc(build_dynamic_proxy_tuple())}</code>\n"
+                       f"chat_id: <code>{ev.chat_id}</code>\n"
+                       f"sender_id: <code>{ev.sender_id}</code>\n\n{txt}")
+                await safe_send_admin(
+                    msg,
+                    parse_mode="html",
+                    buttons=[[
+                        Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
+                        Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
+                        Button.inline("📄 Пасты", f"paste_menu:{ctx_id}".encode()),
+                        Button.inline("🎙 Голосовые", f"voice_menu:{ctx_id}".encode()),
+                    ]]
+                )
 
-        await self.client.start()
+            await self.client.start()
+        except AuthKeyDuplicatedError as e:
+            await self._handle_authkey_duplication(e)
+            raise
+
         self.started = True
         with open(self.session_file, "w", encoding="utf-8") as f:
             f.write(self.client.session.save())
+        self._set_session_invalid_flag(False)
         log.info("[%s] started on %s; device=%s",
                  self.phone, proxy_desc(build_dynamic_proxy_tuple()), self.device.get("device_model"))
 
@@ -337,6 +398,7 @@ class AccountWorker:
             raise
         with open(self.session_file, "w", encoding="utf-8") as f:
             f.write(self.client.session.save())
+        self._set_session_invalid_flag(False)
 
     async def sign_in_2fa(self, password: str):
         await asyncio.sleep(_rand_delay(LOGIN_DELAY_SECONDS))
@@ -349,6 +411,7 @@ class AccountWorker:
             raise
         with open(self.session_file, "w", encoding="utf-8") as f:
             f.write(self.client.session.save())
+        self._set_session_invalid_flag(False) 
 
     async def _reconnect(self):
         # Разорвать соединение и создать новое — получим новый IP от динамического прокси
@@ -425,11 +488,14 @@ class AccountWorker:
         while True:
             try:
                 await self.client.get_me()
+            except AuthKeyDuplicatedError as e:
+                await self._handle_authkey_duplication(e)
+                return
             except FloodWaitError as e:
                 wait = getattr(e, "seconds", getattr(e, "value", 60))
                 log.warning("[%s] flood wait %ss on keepalive", self.phone, wait)
                 await asyncio.sleep(wait + 5)
-                continue               
+                continue
             except Exception as e:
                 log.warning("[%s] connection issue -> reconnect: %s", self.phone, e)
                 try:
@@ -531,7 +597,20 @@ async def on_cb(ev):
             await ev.answer("Пусто", alert=True); await bot_client.send_message(admin_id, "Аккаунтов нет."); return
         lines = ["Аккаунты:"]
         for p,m in accounts_meta.items():
-            lines.append(f"• {p} | api:{m.get('api_id')} | dev:{m.get('device','')}")
+            worker = WORKERS.get(p)
+            active = bool(worker and worker.started)
+            if m.get("session_invalid"):
+                status = "❌"
+                note = " | требуется повторный вход"
+            elif active:
+                status = "🟢"
+                note = ""
+            else:
+                status = "⚠️"
+                note = " | неактивен"
+            lines.append(
+                f"• {status} {p} | api:{m.get('api_id')} | dev:{m.get('device','')}{note}"
+            )
         await ev.answer()
         await bot_client.send_message(admin_id, "\n".join(lines), buttons=account_control_menu())
         return
@@ -837,7 +916,15 @@ async def on_text(ev):
                 pending.pop(admin_id, None)
                 return
             WORKERS[phone] = w
-            await w.start()
+            try:
+                await w.start()
+            except AuthKeyDuplicatedError:
+                pending.pop(admin_id, None)
+                await ev.reply(
+                    "Сессия была аннулирована Telegram из-за одновременного входа с разных IP."
+                    " Попробуй ещё раз через несколько минут."
+                )
+                return
             pending.pop(admin_id, None)
             await ev.reply(f"✅ {phone} добавлен. Слушаю входящие.")
             return
@@ -850,7 +937,17 @@ async def on_text(ev):
                 await w.sign_in_2fa(pwd)
             except Exception as e:
                 await ev.reply(f"2FA ошибка: {e}"); pending.pop(admin_id,None); return
-            WORKERS[phone]=w; await w.start(); pending.pop(admin_id,None)
+            WORKERS[phone]=w
+            try:
+                await w.start()
+            except AuthKeyDuplicatedError:
+                pending.pop(admin_id, None)
+                await ev.reply(
+                    "Сессия была аннулирована Telegram из-за одновременного входа с разных IP."
+                    " Попробуй ещё раз через несколько минут."
+                )
+                return
+            pending.pop(admin_id,None)
             await ev.reply(f"✅ {phone} добавлен (2FA). Слушаю входящие.")
             return
 
@@ -875,6 +972,8 @@ async def startup():
         WORKERS[phone] = w
         try:
             await w.start()
+        except AuthKeyDuplicatedError:
+            log.warning("Worker %s session invalid; waiting for re-login.", phone)
         except Exception as e:
             log.warning("Worker %s not started yet: %s", phone, e)
     await safe_send_admin("🚀 Бот запущен. /start", buttons=main_menu())
