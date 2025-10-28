@@ -3,11 +3,16 @@ import os
 import json
 import logging
 import sys
+import random
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    FloodWaitError,
+    PhoneCodeFloodError,
+)
 import socks  # python-socks
 
 # ================== LOGGING (console + file) ==================
@@ -56,6 +61,13 @@ DYNAMIC_PROXY = {
 # 0 — выключено.
 AUTO_RECONNECT_MINUTES = 0
 
+# Небольшая рандомная задержка перед критичными запросами (код, логин и т.п.)
+LOGIN_DELAY_SECONDS = (5, 15)
+
+# Базовый интервал keepalive с шумом, чтобы избежать синхронных запросов
+KEEPALIVE_INTERVAL_SECONDS = 90
+KEEPALIVE_JITTER = (20, 60)
+
 # Расширенные профили устройств/версий
 DEVICE_PROFILES: List[Dict[str, str]] = [
     {"device_model":"iPhone 12", "system_version":"16.4", "app_version":"10.9.0",  "lang_code":"en"},
@@ -84,6 +96,12 @@ SESSIONS_DIR = "sessions"; os.makedirs(SESSIONS_DIR, exist_ok=True)
 ACCOUNTS_META = "accounts.json"
 ROTATION_STATE = ".rotation_state.json"
 # ============================================
+
+def _rand_delay(span: Tuple[int, int]) -> float:
+    low, high = span
+    if low >= high:
+        return float(low)
+    return random.uniform(low, high)
 
 def _save(d, path):
     with open(path, "w", encoding="utf-8") as f:
@@ -207,15 +225,41 @@ class AccountWorker:
         if not self.client:
             self.client = self._make_client()
         await self.client.connect()
-        return await self.client.send_code_request(self.phone)
+        await asyncio.sleep(_rand_delay(LOGIN_DELAY_SECONDS))
+        try:
+            return await self.client.send_code_request(self.phone)
+        except PhoneCodeFloodError as e:
+            wait = getattr(e, "seconds", getattr(e, "value", 60))
+            log.warning("[%s] phone code flood wait %ss", self.phone, wait)
+            await asyncio.sleep(wait + 5)
+            raise
+        except FloodWaitError as e:
+            wait = getattr(e, "seconds", getattr(e, "value", 60))
+            log.warning("[%s] flood wait %ss on send_code", self.phone, wait)
+            await asyncio.sleep(wait + 5)
+            raise
 
     async def sign_in_code(self, code: str):
-        await self.client.sign_in(self.phone, code)
+        await asyncio.sleep(_rand_delay(LOGIN_DELAY_SECONDS))
+        try:
+            await self.client.sign_in(self.phone, code)
+        except FloodWaitError as e:
+            wait = getattr(e, "seconds", getattr(e, "value", 60))
+            log.warning("[%s] flood wait %ss on sign_in", self.phone, wait)
+            await asyncio.sleep(wait + 5)
+            raise
         with open(self.session_file, "w", encoding="utf-8") as f:
             f.write(self.client.session.save())
 
     async def sign_in_2fa(self, password: str):
-        await self.client.sign_in(password=password)
+        await asyncio.sleep(_rand_delay(LOGIN_DELAY_SECONDS))
+        try:
+            await self.client.sign_in(password=password)
+        except FloodWaitError as e:
+            wait = getattr(e, "seconds", getattr(e, "value", 60))
+            log.warning("[%s] flood wait %ss on 2FA", self.phone, wait)
+            await asyncio.sleep(wait + 5)
+            raise
         with open(self.session_file, "w", encoding="utf-8") as f:
             f.write(self.client.session.save())
 
@@ -234,6 +278,11 @@ class AccountWorker:
         while True:
             try:
                 await self.client.get_me()
+            except FloodWaitError as e:
+                wait = getattr(e, "seconds", getattr(e, "value", 60))
+                log.warning("[%s] flood wait %ss on keepalive", self.phone, wait)
+                await asyncio.sleep(wait + 5)
+                continue               
             except Exception as e:
                 log.warning("[%s] connection issue -> reconnect: %s", self.phone, e)
                 try:
@@ -248,7 +297,8 @@ class AccountWorker:
                 except Exception as ex:
                     log.error("[%s] scheduled reconnect failed: %s", self.phone, ex)
             else:
-                await asyncio.sleep(60)  # обычный интервал проверки
+                interval = KEEPALIVE_INTERVAL_SECONDS + _rand_delay(KEEPALIVE_JITTER)
+                await asyncio.sleep(interval)
 
 # ---- runtime ----
 pending: Dict[int, Dict[str, Any]] = {}
