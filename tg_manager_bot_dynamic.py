@@ -4,6 +4,7 @@ import json
 import logging
 import sys
 import random
+import secrets
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple
 from telethon import TelegramClient, events, Button
@@ -186,20 +187,36 @@ class AccountWorker:
             lang_code=self.device.get("lang_code"),
         )
 
+    async def _ensure_client(self) -> TelegramClient:
+        if not self.client:
+            self.client = self._make_client()
+        if not self.client.is_connected():
+            await self.client.connect()
+        return self.client
+
     async def start(self):
-        self.client = self._make_client()
-        await self.client.connect()
+        self.client = await self._ensure_client()
         if not await self.client.is_user_authorized():
             return
 
         @self.client.on(events.NewMessage(incoming=True))
         async def on_new(ev):
             txt = ev.raw_text or "<media>"
+            ctx_id = secrets.token_hex(4)
+            reply_contexts[ctx_id] = {
+                "phone": self.phone,
+                "chat_id": ev.chat_id,
+                "sender_id": ev.sender_id,
+            }            
             msg = (f"📥 <b>{self.phone}</b>\n"
                    f"proxy: <code>{proxy_desc(build_dynamic_proxy_tuple())}</code>\n"
                    f"chat_id: <code>{ev.chat_id}</code>\n"
                    f"sender_id: <code>{ev.sender_id}</code>\n\n{txt}")
-            await safe_send_admin(msg, parse_mode="html")
+            await safe_send_admin(
+                msg,
+                parse_mode="html",
+                buttons=[[Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode())]]
+            )
 
         await self.client.start()
         self.started = True
@@ -222,9 +239,7 @@ class AccountWorker:
         self.started = False
 
     async def send_code(self):
-        if not self.client:
-            self.client = self._make_client()
-        await self.client.connect()
+        await self._ensure_client()
         await asyncio.sleep(_rand_delay(LOGIN_DELAY_SECONDS))
         try:
             return await self.client.send_code_request(self.phone)
@@ -273,6 +288,33 @@ class AccountWorker:
         self.client = self._make_client()
         await self.start()
 
+    async def validate(self) -> bool:
+        try:
+            client = await self._ensure_client()
+            if not await client.is_user_authorized():
+                return False
+            await client.get_me()
+            return True
+        except Exception as e:
+            log.warning("[%s] validation error: %s", self.phone, e)
+            return False
+
+    async def logout(self):
+        try:
+            client = await self._ensure_client()
+            if await client.is_user_authorized():
+                await client.log_out()
+        except Exception as e:
+            log.warning("[%s] logout error: %s", self.phone, e)
+        finally:
+            await self.stop()
+
+    async def send_outgoing(self, chat_id: int, message: str):
+        client = await self._ensure_client()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Аккаунт не авторизован")
+        await client.send_message(chat_id, message)
+
     async def _keepalive(self):
         """Поддержание соединения: по ошибкам — reconnect; по таймеру (если включён) — тоже."""
         while True:
@@ -303,6 +345,8 @@ class AccountWorker:
 # ---- runtime ----
 pending: Dict[int, Dict[str, Any]] = {}
 WORKERS: Dict[str, AccountWorker] = {}
+reply_contexts: Dict[str, Dict[str, Any]] = {}
+reply_waiting: Dict[int, str] = {}
 
 def main_menu():
     return [
@@ -310,6 +354,20 @@ def main_menu():
         [Button.inline("📋 Список аккаунтов", b"list")],
         [Button.inline("🧪 Ping", b"ping")],
     ]
+
+def account_control_menu():
+    return [
+        [Button.inline("🗑 Удалить аккаунт", b"del_select")],
+        [Button.inline("✅ Валидация", b"val_select")],
+        [Button.inline("⬅️ Назад", b"back")],
+    ]
+
+def build_account_buttons(prefix: str) -> List[List[Button]]:
+    rows: List[List[Button]] = []
+    for phone in list(accounts_meta.keys()):
+        rows.append([Button.inline(phone, f"{prefix}:{phone}".encode())])
+    rows.append([Button.inline("⬅️ Назад", b"list")])
+    return rows
 
 @bot_client.on(events.NewMessage(pattern="/start"))
 async def on_start(ev):
@@ -334,7 +392,83 @@ async def on_cb(ev):
         lines = ["Аккаунты:"]
         for p,m in accounts_meta.items():
             lines.append(f"• {p} | api:{m.get('api_id')} | dev:{m.get('device','')}")
-        await ev.answer(); await bot_client.send_message(ADMIN_ID, "\n".join(lines)); return
+        await ev.answer()
+        await bot_client.send_message(ADMIN_ID, "\n".join(lines), buttons=account_control_menu())
+        return
+
+    if data == "back":
+        await ev.answer()
+        await bot_client.send_message(ADMIN_ID, "Главное меню", buttons=main_menu())
+        return
+
+    if data == "del_select":
+        if not accounts_meta:
+            await ev.answer("Нет аккаунтов", alert=True); return
+        await ev.answer()
+        await bot_client.send_message(ADMIN_ID, "Выбери аккаунт для удаления:", buttons=build_account_buttons("del_do"))
+        return
+
+    if data == "val_select":
+        if not accounts_meta:
+            await ev.answer("Нет аккаунтов", alert=True); return
+        await ev.answer()
+        await bot_client.send_message(ADMIN_ID, "Выбери аккаунт для проверки:", buttons=build_account_buttons("val_do"))
+        return
+
+    if data.startswith("del_do:"):
+        phone = data.split(":", 1)[1]
+        worker = WORKERS.get(phone)
+        await ev.answer()
+        if worker:
+            await worker.logout()
+            WORKERS.pop(phone, None)
+        for ctx_key, ctx_val in list(reply_contexts.items()):
+            if ctx_val.get("phone") == phone:
+                reply_contexts.pop(ctx_key, None)
+                if reply_waiting.get(ADMIN_ID) == ctx_key:
+                    reply_waiting.pop(ADMIN_ID, None)
+        meta = accounts_meta.pop(phone, None)
+        _save(accounts_meta, ACCOUNTS_META)
+        if meta and meta.get("session_file") and os.path.exists(meta["session_file"]):
+            try:
+                os.remove(meta["session_file"])
+            except OSError:
+                pass
+        await bot_client.send_message(ADMIN_ID, f"🗑 Аккаунт {phone} удалён.", buttons=main_menu())
+        return
+
+    if data.startswith("val_do:"):
+        phone = data.split(":", 1)[1]
+        worker = WORKERS.get(phone)
+        await ev.answer()
+        if not worker:
+            await bot_client.send_message(ADMIN_ID, f"⚠️ Аккаунт {phone} не активен.", buttons=main_menu())
+            return
+        ok = await worker.validate()
+        if ok:
+            await bot_client.send_message(ADMIN_ID, f"✅ {phone} активен и принимает сообщения.", buttons=main_menu())
+        else:
+            await bot_client.send_message(ADMIN_ID, f"❌ {phone} не отвечает. Проверь подключение.", buttons=main_menu())
+        return
+
+    if data.startswith("reply:"):
+        ctx = data.split(":", 1)[1]
+        if ctx not in reply_contexts:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        if pending.get(ADMIN_ID):
+            await ev.answer("Заверши текущую операцию", alert=True)
+            return
+        if reply_waiting.get(ADMIN_ID):
+            await ev.answer("Уже жду сообщение", alert=True)
+            return
+        reply_waiting[ADMIN_ID] = ctx
+        await ev.answer()
+        ctx_info = reply_contexts[ctx]
+        await bot_client.send_message(
+            ADMIN_ID,
+            f"Ответ для {ctx_info['phone']} (chat_id {ctx_info['chat_id']}): пришли текст сообщения.")
+        return
 
     if data == "ping":
         await ev.answer(); await bot_client.send_message(ADMIN_ID, "✅ OK", buttons=main_menu()); return
@@ -342,8 +476,30 @@ async def on_cb(ev):
 @bot_client.on(events.NewMessage)
 async def on_text(ev):
     if ev.sender_id != ADMIN_ID: return
-    st = pending.get(ADMIN_ID)
     text = (ev.raw_text or "").strip()
+
+    ctx_id = reply_waiting.get(ADMIN_ID)
+    if ctx_id:
+        if not text:
+            await ev.reply("Пустое сообщение. Пришли текст для отправки.")
+            return
+        reply_waiting.pop(ADMIN_ID, None)
+        ctx = reply_contexts.pop(ctx_id, None)
+        if not ctx:
+            await ev.reply("Контекст ответа устарел.")
+            return
+        worker = WORKERS.get(ctx["phone"])
+        if not worker:
+            await ev.reply("Аккаунт недоступен.")
+            return
+        try:
+            await worker.send_outgoing(ctx["chat_id"], text)
+            await ev.reply("✅ Сообщение отправлено.")
+        except Exception as e:
+            await ev.reply(f"Ошибка отправки: {e}")
+        return
+
+    st = pending.get(ADMIN_ID)
 
     if st:
         if st["step"] == "phone":
