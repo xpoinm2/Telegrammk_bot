@@ -225,7 +225,8 @@ class AccountWorker:
                 "chat_id": ev.chat_id,
                 "sender_id": ev.sender_id,
                 "peer": peer,
-            }           
+                "msg_id": ev.id,
+            }          
             msg = (f"📥 <b>{self.phone}</b>\n"
                    f"proxy: <code>{proxy_desc(build_dynamic_proxy_tuple())}</code>\n"
                    f"chat_id: <code>{ev.chat_id}</code>\n"
@@ -233,7 +234,10 @@ class AccountWorker:
             await safe_send_admin(
                 msg,
                 parse_mode="html",
-                buttons=[[Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode())]]
+                buttons=[[
+                    Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
+                    Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
+                ]]
             )
 
         await self.client.start()
@@ -327,7 +331,13 @@ class AccountWorker:
         finally:
             await self.stop()
 
-    async def send_outgoing(self, chat_id: int, message: str, peer: Optional[Any] = None):
+    async def send_outgoing(
+        self,
+        chat_id: int,
+        message: str,
+        peer: Optional[Any] = None,
+        reply_to_msg_id: Optional[int] = None,
+    ):
         client = await self._ensure_client()
         if not await client.is_user_authorized():
             raise RuntimeError("Аккаунт не авторизован")
@@ -336,7 +346,7 @@ class AccountWorker:
                 peer = await client.get_input_entity(chat_id)
             except Exception:
                 peer = chat_id
-        await client.send_message(peer, message)
+        await client.send_message(peer, message, reply_to=reply_to_msg_id)
 
     async def _keepalive(self):
         """Поддержание соединения: по ошибкам — reconnect; по таймеру (если включён) — тоже."""
@@ -369,7 +379,7 @@ class AccountWorker:
 pending: Dict[int, Dict[str, Any]] = {}
 WORKERS: Dict[str, AccountWorker] = {}
 reply_contexts: Dict[str, Dict[str, Any]] = {}
-reply_waiting: Dict[int, str] = {}
+reply_waiting: Dict[int, Dict[str, Any]] = {}
 
 def main_menu():
     return [
@@ -448,7 +458,8 @@ async def on_cb(ev):
         for ctx_key, ctx_val in list(reply_contexts.items()):
             if ctx_val.get("phone") == phone:
                 reply_contexts.pop(ctx_key, None)
-                if reply_waiting.get(ADMIN_ID) == ctx_key:
+                waiting_ctx = reply_waiting.get(ADMIN_ID)
+                if waiting_ctx and waiting_ctx.get("ctx") == ctx_key:
                     reply_waiting.pop(ADMIN_ID, None)
         meta = accounts_meta.pop(phone, None)
         _save(accounts_meta, ACCOUNTS_META)
@@ -474,7 +485,7 @@ async def on_cb(ev):
             await bot_client.send_message(ADMIN_ID, f"❌ {phone} не отвечает. Проверь подключение.", buttons=main_menu())
         return
 
-    if data.startswith("reply:"):
+    if data.startswith("reply:") or data.startswith("reply_to:"):
         ctx = data.split(":", 1)[1]
         if ctx not in reply_contexts:
             await ev.answer("Контекст истёк", alert=True)
@@ -485,12 +496,15 @@ async def on_cb(ev):
         if reply_waiting.get(ADMIN_ID):
             await ev.answer("Уже жду сообщение", alert=True)
             return
-        reply_waiting[ADMIN_ID] = ctx
+        mode = "reply" if data.startswith("reply_to:") else "normal"
+        reply_waiting[ADMIN_ID] = {"ctx": ctx, "mode": mode}
         await ev.answer()
         ctx_info = reply_contexts[ctx]
+        hint_suffix = " (будет отправлено как reply)." if mode == "reply" else "."
         await bot_client.send_message(
             ADMIN_ID,
-            f"Ответ для {ctx_info['phone']} (chat_id {ctx_info['chat_id']}): пришли текст сообщения.")
+            f"Ответ для {ctx_info['phone']} (chat_id {ctx_info['chat_id']}): пришли текст сообщения{hint_suffix}"
+        )
         return
 
     if data == "ping":
@@ -501,13 +515,14 @@ async def on_text(ev):
     if ev.sender_id != ADMIN_ID: return
     text = (ev.raw_text or "").strip()
 
-    ctx_id = reply_waiting.get(ADMIN_ID)
-    if ctx_id:
+    waiting = reply_waiting.get(ADMIN_ID)
+    if waiting:
         if not text:
             await ev.reply("Пустое сообщение. Пришли текст для отправки.")
             return
         reply_waiting.pop(ADMIN_ID, None)
-        ctx = reply_contexts.pop(ctx_id, None)
+        ctx_id = waiting.get("ctx")
+        ctx = reply_contexts.get(ctx_id)
         if not ctx:
             await ev.reply("Контекст ответа устарел.")
             return
@@ -515,8 +530,14 @@ async def on_text(ev):
         if not worker:
             await ev.reply("Аккаунт недоступен.")
             return
+        reply_to_msg_id = ctx.get("msg_id") if waiting.get("mode") == "reply" else None
         try:
-            await worker.send_outgoing(ctx["chat_id"], text, ctx.get("peer"))
+            await worker.send_outgoing(
+                ctx["chat_id"],
+                text,
+                ctx.get("peer"),
+                reply_to_msg_id=reply_to_msg_id,
+            )
             await ev.reply("✅ Сообщение отправлено.")
         except Exception as e:
             await ev.reply(f"Ошибка отправки: {e}")
