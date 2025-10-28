@@ -12,8 +12,17 @@ from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
     FloodWaitError,
-    PhoneCodeFloodError,
 )
+
+try:  # Telethon <= 1.33.1
+    from telethon.errors import PhoneCodeFloodError  # type: ignore[attr-defined]
+except ImportError:  # Telethon >= 1.34 moved/renamed the error
+    try:
+        from telethon.errors.rpcerrorlist import PhoneCodeFloodError  # type: ignore[attr-defined]
+    except ImportError:
+        from telethon.errors.rpcerrorlist import (
+            PhoneNumberFloodError as PhoneCodeFloodError,  # type: ignore[attr-defined]
+        )
 import socks  # python-socks
 
 # ================== LOGGING (console + file) ==================
