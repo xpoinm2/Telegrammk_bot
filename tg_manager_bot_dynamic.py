@@ -212,11 +212,20 @@ class AccountWorker:
         async def on_new(ev):
             txt = ev.raw_text or "<media>"
             ctx_id = secrets.token_hex(4)
+            peer = None
+            try:
+                peer = await ev.get_input_chat()
+            except Exception:
+                try:
+                    peer = await ev.get_input_sender()
+                except Exception:
+                    peer = None
             reply_contexts[ctx_id] = {
                 "phone": self.phone,
                 "chat_id": ev.chat_id,
                 "sender_id": ev.sender_id,
-            }            
+                "peer": peer,
+            }           
             msg = (f"📥 <b>{self.phone}</b>\n"
                    f"proxy: <code>{proxy_desc(build_dynamic_proxy_tuple())}</code>\n"
                    f"chat_id: <code>{ev.chat_id}</code>\n"
@@ -318,11 +327,16 @@ class AccountWorker:
         finally:
             await self.stop()
 
-    async def send_outgoing(self, chat_id: int, message: str):
+    async def send_outgoing(self, chat_id: int, message: str, peer: Optional[Any] = None):
         client = await self._ensure_client()
         if not await client.is_user_authorized():
             raise RuntimeError("Аккаунт не авторизован")
-        await client.send_message(chat_id, message)
+        if peer is None:
+            try:
+                peer = await client.get_input_entity(chat_id)
+            except Exception:
+                peer = chat_id
+        await client.send_message(peer, message)
 
     async def _keepalive(self):
         """Поддержание соединения: по ошибкам — reconnect; по таймеру (если включён) — тоже."""
@@ -502,7 +516,7 @@ async def on_text(ev):
             await ev.reply("Аккаунт недоступен.")
             return
         try:
-            await worker.send_outgoing(ctx["chat_id"], text)
+            await worker.send_outgoing(ctx["chat_id"], text, ctx.get("peer"))
             await ev.reply("✅ Сообщение отправлено.")
         except Exception as e:
             await ev.reply(f"Ошибка отправки: {e}")
