@@ -48,6 +48,8 @@ except ImportError:  # Telethon >= 1.34 moved/renamed the errors
         UserDeactivatedBanError,
         PhoneNumberBannedError,
     )
+from telethon.tl.types import PeerUser, User
+
 import socks  # python-socks
 
 # ================== LOGGING (console + file) ==================
@@ -479,10 +481,50 @@ class AccountWorker:
                 else:
                     link_label = sender_tag
 
-                if profile_url:
-                    forward_anchor = f"<a href=\"{html.escape(profile_url)}\">{html.escape(link_label)}</a>"
-                else:
-                    forward_anchor = html.escape(link_label)
+                forward_anchor = None
+                forward_header = getattr(ev, "forward", None) or getattr(ev, "fwd_from", None)
+                if forward_header:
+                    forward_label: Optional[str] = None
+                    forward_profile_url: Optional[str] = None
+                    forward_username: Optional[str] = None
+                    forward_id: Optional[int] = None
+                    forward_entity = None
+                    from_peer = getattr(forward_header, "from_id", None)
+                    if from_peer:
+                        with contextlib.suppress(Exception):
+                            forward_entity = await self.client.get_entity(from_peer)
+                    if forward_entity:
+                        forward_label = get_display_name(forward_entity) or None
+                        forward_username = getattr(forward_entity, "username", None)
+                        if isinstance(forward_entity, User):
+                            forward_id = getattr(forward_entity, "id", None)
+                    if isinstance(from_peer, PeerUser) and not forward_id:
+                        forward_id = from_peer.user_id
+                    if not forward_label:
+                        forward_label = getattr(forward_header, "from_name", None)
+                    if not forward_username and forward_entity:
+                        forward_username = getattr(forward_entity, "username", None)
+                    if forward_username:
+                        forward_profile_url = f"https://t.me/{forward_username}"
+                    elif forward_id:
+                        forward_profile_url = f"tg://user?id={forward_id}"
+                    if not forward_label:
+                        if forward_username:
+                            forward_label = f"@{forward_username}"
+                        elif forward_id:
+                            forward_label = f"ID: {forward_id}"
+                    if forward_label:
+                        if forward_profile_url:
+                            forward_anchor = (
+                                f"<a href=\"{html.escape(forward_profile_url)}\">{html.escape(forward_label)}</a>"
+                            )
+                        else:
+                            forward_anchor = html.escape(forward_label)
+                if not forward_anchor:
+                    if profile_url:
+                        forward_anchor = f"<a href=\"{html.escape(profile_url)}\">{html.escape(link_label)}</a>"
+                    else:
+                        forward_anchor = html.escape(link_label)
 
                 info_caption = (
                     f"👤 Аккаунт: <b>{html.escape(account_display)}</b>\n"
