@@ -103,6 +103,14 @@ DEVICE_PROFILES: List[Dict[str, str]] = [
 ]
 
 SESSIONS_DIR = "sessions"; os.makedirs(SESSIONS_DIR, exist_ok=True)
+LIBRARY_DIR = "library"
+PASTES_DIR = os.path.join(LIBRARY_DIR, "pastes")
+VOICES_DIR = os.path.join(LIBRARY_DIR, "voices")
+TEXT_EXTENSIONS = {".txt", ".md"}
+VOICE_EXTENSIONS = {".ogg"}
+for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR):
+    os.makedirs(_dir, exist_ok=True)
+ASSET_TITLE_MAX = 32
 ACCOUNTS_META = "accounts.json"
 ROTATION_STATE = ".rotation_state.json"
 # ============================================
@@ -124,6 +132,38 @@ def _load(path, default):
         except Exception:
             return default
     return default
+
+def _list_files(directory: str, allowed_ext: Set[str]) -> List[str]:
+    if not os.path.isdir(directory):
+        return []
+    files: List[str] = []
+    for name in sorted(os.listdir(directory)):
+        full = os.path.join(directory, name)
+        if not os.path.isfile(full):
+            continue
+        ext = os.path.splitext(name)[1].lower()
+        if allowed_ext and ext not in allowed_ext:
+            continue
+        files.append(full)
+    return files
+
+
+def list_text_templates() -> List[str]:
+    return _list_files(PASTES_DIR, TEXT_EXTENSIONS)
+
+
+def list_voice_templates() -> List[str]:
+    return _list_files(VOICES_DIR, VOICE_EXTENSIONS)
+
+
+def build_asset_keyboard(files: List[str], prefix: str, ctx: str) -> List[List[Button]]:
+    rows: List[List[Button]] = []
+    for idx, path in enumerate(files):
+        base = os.path.splitext(os.path.basename(path))[0]
+        title = base if len(base) <= ASSET_TITLE_MAX else base[: ASSET_TITLE_MAX - 1] + "…"
+        rows.append([Button.inline(title, f"{prefix}:{ctx}:{idx}".encode())])
+    rows.append([Button.inline("⬅️ Закрыть", b"asset_close")])
+    return rows
 
 rotation_state: Dict[str,int] = _load(ROTATION_STATE, {})
 accounts_meta: Dict[str,Dict[str,Any]] = _load(ACCOUNTS_META, {})
@@ -245,6 +285,8 @@ class AccountWorker:
                 buttons=[[
                     Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
                     Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
+                    Button.inline("📄 Пасты", f"paste_menu:{ctx_id}".encode()),
+                    Button.inline("🎙 Голосовые", f"voice_menu:{ctx_id}".encode()),
                 ]]
             )
 
@@ -356,6 +398,28 @@ class AccountWorker:
                 peer = chat_id
         await client.send_message(peer, message, reply_to=reply_to_msg_id)
 
+    async def send_voice(
+        self,
+        chat_id: int,
+        file_path: str,
+        peer: Optional[Any] = None,
+        reply_to_msg_id: Optional[int] = None,
+    ):
+        client = await self._ensure_client()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Аккаунт не авторизован")
+        if peer is None:
+            try:
+                peer = await client.get_input_entity(chat_id)
+            except Exception:
+                peer = chat_id
+        await client.send_file(
+            peer,
+            file_path,
+            voice_note=True,
+            reply_to=reply_to_msg_id,
+        )
+
     async def _keepalive(self):
         """Поддержание соединения: по ошибкам — reconnect; по таймеру (если включён) — тоже."""
         while True:
@@ -418,7 +482,6 @@ async def ensure_menu_keyboard(admin_id: int) -> None:
     except Exception as e:
         log.warning("Cannot show MENU keyboard to %s: %s", admin_id, e)
 
-
 def main_menu():
     return [
         [Button.inline("➕ Добавить аккаунт", b"add")],
@@ -446,6 +509,7 @@ async def on_start(ev):
         await ev.respond("Доступ запрещён."); return
     await cancel_operations(ev.sender_id, notify=False)
     await ev.respond("Менеджер запущен. Выбери действие:", buttons=main_menu())
+    await ensure_menu_keyboard(ev.sender_id)
 
 @bot_client.on(events.CallbackQuery)
 async def on_cb(ev):
@@ -455,6 +519,7 @@ async def on_cb(ev):
     admin_id = ev.sender_id
 
     await cancel_operations(admin_id)
+    await ensure_menu_keyboard(admin_id)
 
     if data == "add":
         pending[admin_id] = {"step":"phone"}
@@ -545,6 +610,127 @@ async def on_cb(ev):
             f"Ответ для {ctx_info['phone']} (chat_id {ctx_info['chat_id']}): пришли текст сообщения{hint_suffix}"
         )
         return
+    
+    if data.startswith("paste_menu:"):
+        ctx = data.split(":", 1)[1]
+        if ctx not in reply_contexts:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        files = list_text_templates()
+        if not files:
+            await ev.answer("Папка с пастами пуста", alert=True)
+            return
+        await ev.answer()
+        await bot_client.send_message(
+            admin_id,
+            "📄 Выбери пасту для отправки:",
+            buttons=build_asset_keyboard(files, "paste_send", ctx),
+        )
+        return
+
+    if data.startswith("paste_send:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        _, ctx, idx_str = parts
+        ctx_info = reply_contexts.get(ctx)
+        if not ctx_info:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            await ev.answer("Некорректный выбор", alert=True)
+            return
+        files = list_text_templates()
+        if idx < 0 or idx >= len(files):
+            await ev.answer("Файл не найден", alert=True)
+            return
+        file_path = files[idx]
+        try:
+            with open(file_path, "r", encoding="utf-8") as f:
+                content = f.read().strip()
+        except Exception as e:
+            await ev.answer(f"Ошибка чтения: {e}", alert=True)
+            return
+        if not content:
+            await ev.answer("Файл пуст", alert=True)
+            return
+        worker = WORKERS.get(ctx_info["phone"])
+        if not worker:
+            await ev.answer("Аккаунт недоступен", alert=True)
+            return
+        try:
+            await worker.send_outgoing(
+                ctx_info["chat_id"],
+                content,
+                ctx_info.get("peer"),
+            )
+        except Exception as e:
+            await ev.answer(f"Ошибка отправки: {e}", alert=True)
+            return
+        await ev.answer("✅ Паста отправлена")
+        await bot_client.send_message(admin_id, "✅ Паста отправлена собеседнику.")
+        return
+
+    if data.startswith("voice_menu:"):
+        ctx = data.split(":", 1)[1]
+        if ctx not in reply_contexts:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        files = list_voice_templates()
+        if not files:
+            await ev.answer("Папка с голосовыми пуста", alert=True)
+            return
+        await ev.answer()
+        await bot_client.send_message(
+            admin_id,
+            "🎙 Выбери голосовое сообщение:",
+            buttons=build_asset_keyboard(files, "voice_send", ctx),
+        )
+        return
+
+    if data.startswith("voice_send:"):
+        parts = data.split(":")
+        if len(parts) != 3:
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        _, ctx, idx_str = parts
+        ctx_info = reply_contexts.get(ctx)
+        if not ctx_info:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            await ev.answer("Некорректный выбор", alert=True)
+            return
+        files = list_voice_templates()
+        if idx < 0 or idx >= len(files):
+            await ev.answer("Файл не найден", alert=True)
+            return
+        file_path = files[idx]
+        worker = WORKERS.get(ctx_info["phone"])
+        if not worker:
+            await ev.answer("Аккаунт недоступен", alert=True)
+            return
+        try:
+            await worker.send_voice(
+                ctx_info["chat_id"],
+                file_path,
+                ctx_info.get("peer"),
+            )
+        except Exception as e:
+            await ev.answer(f"Ошибка отправки: {e}", alert=True)
+            return
+        await ev.answer("✅ Голосовое отправлено")
+        await bot_client.send_message(admin_id, "✅ Голосовое сообщение отправлено собеседнику.")
+        return
+
+    if data == "asset_close":
+        await ev.answer()
+        return
 
     if data == "ping":
         await ev.answer(); await bot_client.send_message(admin_id, "✅ OK", buttons=main_menu()); return
@@ -554,6 +740,13 @@ async def on_text(ev):
     if not is_admin(ev.sender_id): return
     text = (ev.raw_text or "").strip()
     admin_id = ev.sender_id
+
+    await ensure_menu_keyboard(admin_id)
+
+    if text.upper() == MENU_BUTTON_TEXT:
+        await cancel_operations(admin_id)
+        await bot_client.send_message(admin_id, "Менеджер запущен. Выбери действие:", buttons=main_menu())
+        return
 
     if text.startswith("/"):
         await cancel_operations(admin_id)
