@@ -166,14 +166,30 @@ def list_voice_templates() -> List[str]:
     return _list_files(VOICES_DIR, VOICE_EXTENSIONS)
 
 
-def build_asset_keyboard(files: List[str], prefix: str, ctx: str) -> List[List[Button]]:
+def build_asset_keyboard(
+    files: List[str],
+    prefix: str,
+    ctx: str,
+    mode: Optional[str] = None,
+) -> List[List[Button]]:
     rows: List[List[Button]] = []
     for idx, path in enumerate(files):
         base = os.path.splitext(os.path.basename(path))[0]
         title = base if len(base) <= ASSET_TITLE_MAX else base[: ASSET_TITLE_MAX - 1] + "…"
-        rows.append([Button.inline(title, f"{prefix}:{ctx}:{idx}".encode())])
+        payload = f"{prefix}:{ctx}:{idx}" if mode is None else f"{prefix}:{ctx}:{mode}:{idx}"
+        rows.append([Button.inline(title, payload.encode())])
     rows.append([Button.inline("⬅️ Закрыть", b"asset_close")])
     return rows
+
+
+def build_reply_options_keyboard(ctx: str, mode: str) -> List[List[Button]]:
+    return [
+        [
+            Button.inline("📄 Пасты", f"reply_paste_menu:{ctx}:{mode}".encode()),
+            Button.inline("🎙 Голосовые", f"reply_voice_menu:{ctx}:{mode}".encode()),
+        ],
+        [Button.inline("❌ Отмена", f"reply_cancel:{ctx}".encode())],
+    ]
 
 rotation_state: Dict[str,int] = _load(ROTATION_STATE, {})
 accounts_meta: Dict[str,Dict[str,Any]] = _load(ACCOUNTS_META, {})
@@ -584,7 +600,8 @@ async def on_cb(ev):
     data = ev.data.decode() if isinstance(ev.data, (bytes, bytearray)) else str(ev.data)
     admin_id = ev.sender_id
 
-    await cancel_operations(admin_id)
+    notify_cancel = not data.startswith(("reply",))
+    await cancel_operations(admin_id, notify=notify_cancel)
     await ensure_menu_keyboard(admin_id)
 
     if data == "add":
@@ -686,7 +703,47 @@ async def on_cb(ev):
         hint_suffix = " (будет отправлено как reply)." if mode == "reply" else "."
         await bot_client.send_message(
             admin_id,
-            f"Ответ для {ctx_info['phone']} (chat_id {ctx_info['chat_id']}): пришли текст сообщения{hint_suffix}"
+            (
+                f"Ответ для {ctx_info['phone']} (chat_id {ctx_info['chat_id']}): "
+                f"пришли текст сообщения{hint_suffix}\n"
+                "Или выбери шаблон ниже."
+            ),
+            buttons=build_reply_options_keyboard(ctx, mode),
+        )
+        return
+
+    if data.startswith("reply_cancel:"):
+        await ev.answer()
+        await bot_client.send_message(admin_id, "❌ Ответ отменён.")
+        return
+
+    if data.startswith("reply_paste_menu:") or data.startswith("reply_voice_menu:"):
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        _, ctx, mode = parts
+        if ctx not in reply_contexts:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        files = (
+            list_text_templates()
+            if data.startswith("reply_paste_menu:")
+            else list_voice_templates()
+        )
+        if not files:
+            await ev.answer(
+                "Папка с пастами пуста" if data.startswith("reply_paste_menu:") else "Папка с голосовыми пуста",
+                alert=True,
+            )
+            return
+        await ev.answer()
+        title = "📄 Выбери пасту для отправки:" if data.startswith("reply_paste_menu:") else "🎙 Выбери голосовое сообщение:"
+        prefix = "paste_send" if data.startswith("reply_paste_menu:") else "voice_send"
+        await bot_client.send_message(
+            admin_id,
+            title,
+            buttons=build_asset_keyboard(files, prefix, ctx, mode),
         )
         return
     
@@ -709,10 +766,16 @@ async def on_cb(ev):
 
     if data.startswith("paste_send:"):
         parts = data.split(":")
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             await ev.answer("Некорректные данные", alert=True)
             return
-        _, ctx, idx_str = parts
+        if len(parts) == 3:
+            _, ctx, idx_str = parts
+            mode = "normal"
+        else:
+            _, ctx, mode, idx_str = parts
+            if mode not in {"normal", "reply"}:
+                mode = "normal"
         ctx_info = reply_contexts.get(ctx)
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
@@ -740,11 +803,13 @@ async def on_cb(ev):
         if not worker:
             await ev.answer("Аккаунт недоступен", alert=True)
             return
+        reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
         try:
             await worker.send_outgoing(
                 ctx_info["chat_id"],
                 content,
                 ctx_info.get("peer"),
+                reply_to_msg_id=reply_to_msg_id,
             )
         except Exception as e:
             await ev.answer(f"Ошибка отправки: {e}", alert=True)
@@ -772,10 +837,16 @@ async def on_cb(ev):
 
     if data.startswith("voice_send:"):
         parts = data.split(":")
-        if len(parts) != 3:
+        if len(parts) not in (3, 4):
             await ev.answer("Некорректные данные", alert=True)
             return
-        _, ctx, idx_str = parts
+        if len(parts) == 3:
+            _, ctx, idx_str = parts
+            mode = "normal"
+        else:
+            _, ctx, mode, idx_str = parts
+            if mode not in {"normal", "reply"}:
+                mode = "normal"
         ctx_info = reply_contexts.get(ctx)
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
@@ -794,11 +865,13 @@ async def on_cb(ev):
         if not worker:
             await ev.answer("Аккаунт недоступен", alert=True)
             return
+        reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
         try:
             await worker.send_voice(
                 ctx_info["chat_id"],
                 file_path,
                 ctx_info.get("peer"),
+                reply_to_msg_id=reply_to_msg_id,
             )
         except Exception as e:
             await ev.answer(f"Ошибка отправки: {e}", alert=True)
