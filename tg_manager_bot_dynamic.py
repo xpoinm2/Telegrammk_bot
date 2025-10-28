@@ -6,7 +6,7 @@ import sys
 import random
 import secrets
 from logging.handlers import RotatingFileHandler
-from typing import Dict, Optional, Any, List, Tuple
+from typing import Dict, Optional, Any, List, Tuple, Set
 from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import (
@@ -388,6 +388,8 @@ pending: Dict[int, Dict[str, Any]] = {}
 WORKERS: Dict[str, AccountWorker] = {}
 reply_contexts: Dict[str, Dict[str, Any]] = {}
 reply_waiting: Dict[int, Dict[str, Any]] = {}
+MENU_BUTTON_TEXT = "MENU"
+menu_keyboard_shown: Set[int] = set()
 
 async def cancel_operations(admin_id: int, notify: bool = True) -> bool:
     """Сбрасывает незавершённые операции для конкретного админа."""
@@ -399,6 +401,23 @@ async def cancel_operations(admin_id: int, notify: bool = True) -> bool:
     if cancelled and notify:
         await bot_client.send_message(admin_id, "❌ Текущая операция отменена.")
     return cancelled
+
+def menu_keyboard() -> List[List[Button]]:
+    return [[Button.text(MENU_BUTTON_TEXT, resize=True)]]
+
+async def ensure_menu_keyboard(admin_id: int) -> None:
+    if admin_id in menu_keyboard_shown:
+        return
+    try:
+        await bot_client.send_message(
+            admin_id,
+            "⌨️ Чтобы вернуться в главное меню, нажимай кнопку MENU слева от скрепки.",
+            buttons=menu_keyboard(),
+        )
+        menu_keyboard_shown.add(admin_id)
+    except Exception as e:
+        log.warning("Cannot show MENU keyboard to %s: %s", admin_id, e)
+
 
 def main_menu():
     return [
