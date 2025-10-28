@@ -6,9 +6,12 @@ import logging
 import sys
 import random
 import secrets
+import html
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple, Set
+from io import BytesIO
 from telethon import TelegramClient, events, Button
+from telethon.utils import get_display_name
 from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -238,6 +241,23 @@ async def safe_send_admin(text: str, **kwargs):
             )
             continue
 
+
+async def safe_send_admin_file(file_data: bytes, filename: str, **kwargs) -> None:
+    if not file_data:
+        return
+    for admin_id in ADMIN_IDS:
+        try:
+            bio = BytesIO(file_data)
+            bio.name = filename
+            await bot_client.send_file(admin_id, bio, **kwargs)
+        except Exception as e:
+            logging.getLogger("mgrbot").warning(
+                "Cannot send file to admin %s yet (probably admin hasn't started the bot): %s",
+                admin_id,
+                e,
+            )
+            continue
+
 # ---- dynamic proxy tuple ----
 def build_dynamic_proxy_tuple() -> Optional[Tuple]:
     if not DYNAMIC_PROXY.get("enabled"):
@@ -271,6 +291,7 @@ class AccountWorker:
         self.client: Optional[TelegramClient] = None
         self.started = False
         self._keepalive_task: Optional[asyncio.Task] = None
+        self.account_name: Optional[str] = None
 
     def _reset_session_state(self) -> None:
         with contextlib.suppress(FileNotFoundError):
@@ -385,6 +406,26 @@ class AccountWorker:
             self.client = await self._ensure_client()
             if not await self.client.is_user_authorized():
                 return
+            
+            try:
+                me = await self.client.get_me()
+                self.account_name = get_display_name(me)
+            except Exception:
+                self.account_name = None
+
+            meta = accounts_meta.get(self.phone)
+            if meta is None:
+                meta = accounts_meta[self.phone] = {"phone": self.phone}
+            changed = False
+            if self.account_name:
+                if meta.get("full_name") != self.account_name:
+                    meta["full_name"] = self.account_name
+                    changed = True
+            else:
+                if meta.pop("full_name", None) is not None:
+                    changed = True
+            if changed:
+                _save(accounts_meta, ACCOUNTS_META)
 
             @self.client.on(events.NewMessage(incoming=True))
             async def on_new(ev):
@@ -398,6 +439,58 @@ class AccountWorker:
                         peer = await ev.get_input_sender()
                     except Exception:
                         peer = None
+                account_display = self.account_name or accounts_meta.get(self.phone, {}).get("full_name")
+                if not account_display:
+                    account_display = self.phone
+                sender_entity = None
+                with contextlib.suppress(Exception):
+                    sender_entity = await ev.get_sender()
+                sender_name = get_display_name(sender_entity) if sender_entity else None
+                sender_username = getattr(sender_entity, "username", None) if sender_entity else None
+                sender_tag = f"@{sender_username}" if sender_username else (
+                    f"ID: {ev.sender_id}" if ev.sender_id else "ID: unknown"
+                )
+                forward_label_parts: List[str] = []
+                if sender_name:
+                    forward_label_parts.append(sender_name)
+                if sender_username:
+                    forward_label_parts.append(f"@{sender_username}")
+                if not forward_label_parts:
+                    forward_label_parts.append(sender_tag)
+                forward_label = " ".join(forward_label_parts)
+
+                avatar_bytes: Optional[bytes] = None
+                if sender_entity:
+                    try:
+                        buffer = BytesIO()
+                        result = await self.client.download_profile_photo(sender_entity, file=buffer)
+                        if isinstance(result, BytesIO):
+                            avatar_bytes = result.getvalue()
+                        elif isinstance(result, bytes):
+                            avatar_bytes = result
+                        else:
+                            data = buffer.getvalue()
+                            avatar_bytes = data if data else None
+                    except Exception:
+                        avatar_bytes = None
+
+                info_caption = (
+                    f"👤 Аккаунт: <b>{html.escape(account_display)}</b>\n"
+                    f"👥 Собеседник: <b>{html.escape(sender_name) if sender_name else '—'}</b>\n"
+                    f"🔗 {html.escape(sender_tag)}"
+                )
+                if avatar_bytes:
+                    await safe_send_admin_file(
+                        avatar_bytes,
+                        filename=f"avatar_{ev.sender_id or 'unknown'}.jpg",
+                        caption=info_caption,
+                        parse_mode="html",
+                    )
+                else:
+                    await safe_send_admin(info_caption, parse_mode="html")
+
+                forward_text = f"Forwarded from {forward_label}\n\n{txt}"
+
                 reply_contexts[ctx_id] = {
                     "phone": self.phone,
                     "chat_id": ev.chat_id,
@@ -405,19 +498,15 @@ class AccountWorker:
                     "peer": peer,
                     "msg_id": ev.id,
                 }
-                msg = (f"📥 <b>{self.phone}</b>\n"
-                       f"proxy: <code>{proxy_desc(build_dynamic_proxy_tuple())}</code>\n"
-                       f"chat_id: <code>{ev.chat_id}</code>\n"
-                       f"sender_id: <code>{ev.sender_id}</code>\n\n{txt}")
                 await safe_send_admin(
-                    msg,
-                    parse_mode="html",
+                    forward_text,
                     buttons=[[
                         Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
                         Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
                         Button.inline("📄 Пасты", f"paste_menu:{ctx_id}".encode()),
                         Button.inline("🎙 Голосовые", f"voice_menu:{ctx_id}".encode()),
-                    ]]
+                    ]],
+                    link_preview=False,
                 )
 
             await self.client.start()
