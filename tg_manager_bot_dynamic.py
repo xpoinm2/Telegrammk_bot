@@ -526,13 +526,14 @@ class AccountWorker:
                     else:
                         forward_anchor = html.escape(link_label)
 
-                info_caption = (
-                    f"👤 Аккаунт: <b>{html.escape(account_display)}</b>\n"
-                    f"👥 Собеседник: <b>{html.escape(sender_name) if sender_name else '—'}</b>\n"
-                    f"🔗 {html.escape(sender_tag)}\n\n"
-                    f"Forwarded from {forward_anchor}\n\n"
-                    f"{html.escape(txt)}"
-                )
+                info_lines = [
+                    f"👤 Аккаунт: <b>{html.escape(account_display)}</b>",
+                    f"👥 Собеседник: <b>{html.escape(sender_name) if sender_name else '—'}</b>",
+                    f"🔗 {html.escape(sender_tag)}",
+                ]
+                if forward_anchor:
+                    info_lines.extend(["", f"Forwarded from {forward_anchor}"])
+                info_caption = "\n".join(info_lines)
 
                 reply_contexts[ctx_id] = {
                     "phone": self.phone,
@@ -541,12 +542,18 @@ class AccountWorker:
                     "peer": peer,
                     "msg_id": ev.id,
                 }
-                buttons = [[
-                    Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
-                    Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
-                    Button.inline("📄 Пасты", f"paste_menu:{ctx_id}".encode()),
-                    Button.inline("🎙 Голосовые", f"voice_menu:{ctx_id}".encode()),
-                ]]
+                buttons: List[List[Button]] = [
+                    [
+                        Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
+                        Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
+                    ],
+                    [
+                        Button.inline("📄 Пасты", f"paste_menu:{ctx_id}".encode()),
+                        Button.inline("🎙 Голосовые", f"voice_menu:{ctx_id}".encode()),
+                    ],
+                ]
+                if profile_url:
+                    buttons.append([Button.url("🔗 Открыть профиль", profile_url)])
 
                 if avatar_bytes:
                     await safe_send_admin_file(
@@ -560,6 +567,13 @@ class AccountWorker:
                     await safe_send_admin(
                         info_caption,
                         buttons=buttons,
+                        parse_mode="html",
+                        link_preview=False,
+                    )
+
+                if txt:
+                    await safe_send_admin(
+                        f"💬 <b>Сообщение:</b>\n{html.escape(txt)}",
                         parse_mode="html",
                         link_preview=False,
                     )
