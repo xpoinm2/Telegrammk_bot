@@ -33,6 +33,18 @@ except ImportError:  # Telethon >= 1.34 moved/renamed the error
         from telethon.errors.rpcerrorlist import (
             PhoneNumberFloodError as PhoneCodeFloodError,  # type: ignore[attr-defined]
         )
+try:  # Telethon <= 1.33.1
+    from telethon.errors import (  # type: ignore[attr-defined]
+        UserDeactivatedError,
+        UserDeactivatedBanError,
+        PhoneNumberBannedError,
+    )
+except ImportError:  # Telethon >= 1.34 moved/renamed the errors
+    from telethon.errors.rpcerrorlist import (  # type: ignore[attr-defined]
+        UserDeactivatedError,
+        UserDeactivatedBanError,
+        PhoneNumberBannedError,
+    )
 import socks  # python-socks
 
 # ================== LOGGING (console + file) ==================
@@ -280,6 +292,52 @@ class AccountWorker:
         if changed:
             _save(accounts_meta, ACCOUNTS_META)
 
+    def _set_account_state(self, state: Optional[str], details: Optional[str] = None) -> None:
+        meta = accounts_meta.get(self.phone)
+        if not meta:
+            return
+        changed = False
+        if state:
+            if meta.get("state") != state:
+                meta["state"] = state
+                changed = True
+        else:
+            if meta.pop("state", None) is not None:
+                changed = True
+        if details:
+            if meta.get("state_note") != details:
+                meta["state_note"] = details
+                changed = True
+        else:
+            if meta.pop("state_note", None) is not None:
+                changed = True
+        if changed:
+            _save(accounts_meta, ACCOUNTS_META)
+
+    async def _handle_account_disabled(self, state: str, error: Exception) -> None:
+        human = "заморожен" if state == "frozen" else "заблокирован"
+        log.warning("[%s] account %s by Telegram: %s", self.phone, human, error)
+        meta = accounts_meta.get(self.phone) or {}
+        prev_state = meta.get("state")
+        prev_note = meta.get("state_note")
+        self._set_account_state(state, str(error))
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+        self._keepalive_task = None
+        if self.client:
+            with contextlib.suppress(Exception):
+                await self.client.disconnect()
+        self.client = None
+        self.started = False
+        if prev_state != state or prev_note != str(error):
+            await safe_send_admin(
+                (
+                    f"⛔️ <b>{self.phone}</b>: аккаунт {human} Telegram.\n"
+                    f"Ответ: <code>{error}</code>"
+                ),
+                parse_mode="html",
+            )
+
     async def _handle_authkey_duplication(self, error: Exception) -> None:
         log.warning(
             "[%s] session revoked by Telegram due to IP mismatch: %s",
@@ -366,11 +424,18 @@ class AccountWorker:
         except AuthKeyDuplicatedError as e:
             await self._handle_authkey_duplication(e)
             raise
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise
 
         self.started = True
         with open(self.session_file, "w", encoding="utf-8") as f:
             f.write(self.client.session.save())
         self._set_session_invalid_flag(False)
+        self._set_account_state(None)
         log.info("[%s] started on %s; device=%s",
                  self.phone, proxy_desc(build_dynamic_proxy_tuple()), self.device.get("device_model"))
 
@@ -392,6 +457,12 @@ class AccountWorker:
         await asyncio.sleep(_rand_delay(LOGIN_DELAY_SECONDS))
         try:
             return await self.client.send_code_request(self.phone)
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise
         except PhoneCodeFloodError as e:
             wait = getattr(e, "seconds", getattr(e, "value", 60))
             log.warning("[%s] phone code flood wait %ss", self.phone, wait)
@@ -407,6 +478,12 @@ class AccountWorker:
         await asyncio.sleep(_rand_delay(LOGIN_DELAY_SECONDS))
         try:
             await self.client.sign_in(self.phone, code)
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise
         except FloodWaitError as e:
             wait = getattr(e, "seconds", getattr(e, "value", 60))
             log.warning("[%s] flood wait %ss on sign_in", self.phone, wait)
@@ -415,11 +492,18 @@ class AccountWorker:
         with open(self.session_file, "w", encoding="utf-8") as f:
             f.write(self.client.session.save())
         self._set_session_invalid_flag(False)
+        self._set_account_state(None)
 
     async def sign_in_2fa(self, password: str):
         await asyncio.sleep(_rand_delay(LOGIN_DELAY_SECONDS))
         try:
             await self.client.sign_in(password=password)
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise
         except FloodWaitError as e:
             wait = getattr(e, "seconds", getattr(e, "value", 60))
             log.warning("[%s] flood wait %ss on 2FA", self.phone, wait)
@@ -427,7 +511,8 @@ class AccountWorker:
             raise
         with open(self.session_file, "w", encoding="utf-8") as f:
             f.write(self.client.session.save())
-        self._set_session_invalid_flag(False) 
+        self._set_session_invalid_flag(False)
+        self._set_account_state(None)
 
     async def _reconnect(self):
         # Разорвать соединение и создать новое — получим новый IP от динамического прокси
@@ -445,7 +530,14 @@ class AccountWorker:
             if not await client.is_user_authorized():
                 return False
             await client.get_me()
+            self._set_account_state(None)
             return True
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            return False
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            return False
         except Exception as e:
             log.warning("[%s] validation error: %s", self.phone, e)
             return False
@@ -475,7 +567,14 @@ class AccountWorker:
                 peer = await client.get_input_entity(chat_id)
             except Exception:
                 peer = chat_id
-        await client.send_message(peer, message, reply_to=reply_to_msg_id)
+        try:
+            await client.send_message(peer, message, reply_to=reply_to_msg_id)
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise RuntimeError("Аккаунт заблокирован Telegram")
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise RuntimeError("Аккаунт заморожен Telegram")
 
     async def send_voice(
         self,
@@ -492,12 +591,19 @@ class AccountWorker:
                 peer = await client.get_input_entity(chat_id)
             except Exception:
                 peer = chat_id
-        await client.send_file(
-            peer,
-            file_path,
-            voice_note=True,
-            reply_to=reply_to_msg_id,
-        )
+        try:
+            await client.send_file(
+                peer,
+                file_path,
+                voice_note=True,
+                reply_to=reply_to_msg_id,
+            )
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise RuntimeError("Аккаунт заблокирован Telegram")
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise RuntimeError("Аккаунт заморожен Telegram")
 
     async def _keepalive(self):
         """Поддержание соединения: по ошибкам — reconnect; по таймеру (если включён) — тоже."""
@@ -506,6 +612,12 @@ class AccountWorker:
                 await self.client.get_me()
             except AuthKeyDuplicatedError as e:
                 await self._handle_authkey_duplication(e)
+                return
+            except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+                await self._handle_account_disabled("banned", e)
+                return
+            except UserDeactivatedError as e:
+                await self._handle_account_disabled("frozen", e)
                 return
             except FloodWaitError as e:
                 wait = getattr(e, "seconds", getattr(e, "value", 60))
@@ -616,7 +728,17 @@ async def on_cb(ev):
         for p,m in accounts_meta.items():
             worker = WORKERS.get(p)
             active = bool(worker and worker.started)
-            if m.get("session_invalid"):
+            state = m.get("state")
+            note_extra = ""
+            if m.get("state_note"):
+                note_extra = f" ({m['state_note']})"
+            if state == "banned":
+                status = "⛔️"
+                note = " | заблокирован Telegram"
+            elif state == "frozen":
+                status = "🧊"
+                note = " | заморожен Telegram"
+            elif m.get("session_invalid"):
                 status = "❌"
                 note = " | требуется повторный вход"
             elif active:
@@ -626,7 +748,7 @@ async def on_cb(ev):
                 status = "⚠️"
                 note = " | неактивен"
             lines.append(
-                f"• {status} {p} | api:{m.get('api_id')} | dev:{m.get('device','')}{note}"
+                f"• {status} {p} | api:{m.get('api_id')} | dev:{m.get('device','')}{note}{note_extra}"
             )
         await ev.answer()
         await bot_client.send_message(admin_id, "\n".join(lines), buttons=account_control_menu())
@@ -678,14 +800,41 @@ async def on_cb(ev):
         phone = data.split(":", 1)[1]
         worker = WORKERS.get(phone)
         await ev.answer()
+        meta = accounts_meta.get(phone, {})
+        state = meta.get("state")
         if not worker:
-            await bot_client.send_message(admin_id, f"⚠️ Аккаунт {phone} не активен.", buttons=main_menu())
+            if state == "banned":
+                await bot_client.send_message(
+                    admin_id,
+                    f"⛔️ {phone} заблокирован Telegram. Аккаунт отключён.",
+                    buttons=main_menu(),
+                )
+            elif state == "frozen":
+                await bot_client.send_message(
+                    admin_id,
+                    f"🧊 {phone} заморожен Telegram. Требуется разблокировка.",
+                    buttons=main_menu(),
+                )
+            else:
+                await bot_client.send_message(admin_id, f"⚠️ Аккаунт {phone} не активен.", buttons=main_menu())
             return
         ok = await worker.validate()
         if ok:
             await bot_client.send_message(admin_id, f"✅ {phone} активен и принимает сообщения.", buttons=main_menu())
+        elif state == "banned":
+            await bot_client.send_message(
+                admin_id,
+                f"⛔️ {phone} заблокирован Telegram. Аккаунт отключён.",
+                buttons=main_menu(),
+            )
+        elif state == "frozen":
+            await bot_client.send_message(
+                admin_id,
+                f"🧊 {phone} заморожен Telegram. Требуется разблокировка.",
+                buttons=main_menu(),
+            )
         else:
-             await bot_client.send_message(admin_id, f"❌ {phone} не отвечает. Проверь подключение.", buttons=main_menu())
+            await bot_client.send_message(admin_id, f"❌ {phone} не отвечает. Проверь подключение.", buttons=main_menu())
         return
 
     if data.startswith("reply:") or data.startswith("reply_to:"):
