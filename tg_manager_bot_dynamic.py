@@ -449,16 +449,7 @@ class AccountWorker:
                 sender_username = getattr(sender_entity, "username", None) if sender_entity else None
                 sender_tag = f"@{sender_username}" if sender_username else (
                     f"ID: {ev.sender_id}" if ev.sender_id else "ID: unknown"
-                )
-                forward_label_parts: List[str] = []
-                if sender_name:
-                    forward_label_parts.append(sender_name)
-                if sender_username:
-                    forward_label_parts.append(f"@{sender_username}")
-                if not forward_label_parts:
-                    forward_label_parts.append(sender_tag)
-                forward_label = " ".join(forward_label_parts)
-
+                )            
                 avatar_bytes: Optional[bytes] = None
                 if sender_entity:
                     try:
@@ -474,22 +465,32 @@ class AccountWorker:
                     except Exception:
                         avatar_bytes = None
 
+                if sender_username:
+                    profile_url = f"https://t.me/{sender_username}"
+                elif ev.sender_id:
+                    profile_url = f"tg://user?id={ev.sender_id}"
+                else:
+                    profile_url = None
+
+                if sender_name:
+                    link_label = sender_name
+                elif sender_username:
+                    link_label = f"@{sender_username}"
+                else:
+                    link_label = sender_tag
+
+                if profile_url:
+                    forward_anchor = f"<a href=\"{html.escape(profile_url)}\">{html.escape(link_label)}</a>"
+                else:
+                    forward_anchor = html.escape(link_label)
+
                 info_caption = (
                     f"👤 Аккаунт: <b>{html.escape(account_display)}</b>\n"
                     f"👥 Собеседник: <b>{html.escape(sender_name) if sender_name else '—'}</b>\n"
-                    f"🔗 {html.escape(sender_tag)}"
+                    f"🔗 {html.escape(sender_tag)}\n\n"
+                    f"Forwarded from {forward_anchor}\n\n"
+                    f"{html.escape(txt)}"
                 )
-                if avatar_bytes:
-                    await safe_send_admin_file(
-                        avatar_bytes,
-                        filename=f"avatar_{ev.sender_id or 'unknown'}.jpg",
-                        caption=info_caption,
-                        parse_mode="html",
-                    )
-                else:
-                    await safe_send_admin(info_caption, parse_mode="html")
-
-                forward_text = f"Forwarded from {forward_label}\n\n{txt}"
 
                 reply_contexts[ctx_id] = {
                     "phone": self.phone,
@@ -498,16 +499,28 @@ class AccountWorker:
                     "peer": peer,
                     "msg_id": ev.id,
                 }
-                await safe_send_admin(
-                    forward_text,
-                    buttons=[[
-                        Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
-                        Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
-                        Button.inline("📄 Пасты", f"paste_menu:{ctx_id}".encode()),
-                        Button.inline("🎙 Голосовые", f"voice_menu:{ctx_id}".encode()),
-                    ]],
-                    link_preview=False,
-                )
+                buttons = [[
+                    Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
+                    Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
+                    Button.inline("📄 Пасты", f"paste_menu:{ctx_id}".encode()),
+                    Button.inline("🎙 Голосовые", f"voice_menu:{ctx_id}".encode()),
+                ]]
+
+                if avatar_bytes:
+                    await safe_send_admin_file(
+                        avatar_bytes,
+                        filename=f"avatar_{ev.sender_id or 'unknown'}.jpg",
+                        caption=info_caption,
+                        buttons=buttons,
+                        parse_mode="html",
+                    )
+                else:
+                    await safe_send_admin(
+                        info_caption,
+                        buttons=buttons,
+                        parse_mode="html",
+                        link_preview=False,
+                    )
 
             await self.client.start()
         except AuthKeyDuplicatedError as e:
