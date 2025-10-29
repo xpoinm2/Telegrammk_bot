@@ -48,7 +48,14 @@ if exist venv (
 if not exist venv (
     echo.
     echo Создаётся виртуальное окружение...
-    "%PYTHON_CMD%" -m venv venv || goto :fail
+    "%PYTHON_CMD%" -m venv venv >nul 2>&1
+    if errorlevel 1 (
+        echo.
+        echo Обнаружена ошибка ensurepip при создании venv, пробуем fallback через virtualenv...
+        "%PYTHON_CMD%" -m pip --version >nul 2>&1 || "%PYTHON_CMD%" -m ensurepip --default-pip || goto :fail
+        "%PYTHON_CMD%" -m pip install --user --upgrade virtualenv || goto :fail
+        "%PYTHON_CMD%" -m virtualenv venv || goto :fail
+    )
 )
 
 call venv\Scripts\activate
