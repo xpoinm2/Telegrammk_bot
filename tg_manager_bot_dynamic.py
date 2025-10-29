@@ -299,19 +299,36 @@ async def safe_send_admin_file(file_data: bytes, filename: str, **kwargs) -> Non
             continue
 
 # ---- dynamic proxy tuple ----
-def build_dynamic_proxy_tuple() -> Optional[Tuple]:
-    if not DYNAMIC_PROXY.get("enabled"):
+def _proxy_tuple_from_config(config: Optional[Dict[str, Any]], *, context: str = "dynamic") -> Optional[Tuple]:
+    if not config:
         return None
-    t = DYNAMIC_PROXY.get("type","HTTP").upper()
-    host = DYNAMIC_PROXY["host"]; port = int(DYNAMIC_PROXY["port"])
-    rdns = bool(DYNAMIC_PROXY.get("rdns", True))
-    user = DYNAMIC_PROXY.get("username"); pwd = DYNAMIC_PROXY.get("password")
-    if t == "SOCKS5":
-        return (socks.SOCKS5, host, port, rdns, user, pwd)
-    elif t == "SOCKS4":
-        return (socks.SOCKS4, host, port, rdns, user, pwd)
+    if not bool(config.get("enabled", True)):
+        return None
+    host = config.get("host")
+    port = config.get("port")
+    if not host or port is None:
+        log.warning("Proxy config %s is missing host/port: %s", context, config)
+        return None
+    try:
+        port_int = int(port)
+    except (TypeError, ValueError):
+        log.warning("Proxy config %s has invalid port %r", context, port)
+        return None
+    proxy_type = str(config.get("type", "HTTP")).upper()
+    if proxy_type in {"SOCKS", "SOCKS5"}:
+        proxy_const = socks.SOCKS5
+    elif proxy_type == "SOCKS4":
+        proxy_const = socks.SOCKS4
     else:
-        return (socks.HTTP, host, port, rdns, user, pwd)
+        proxy_const = socks.HTTP
+    rdns = bool(config.get("rdns", True))
+    username = config.get("username")
+    password = config.get("password")
+    return (proxy_const, host, port_int, rdns, username, password)
+
+
+def build_dynamic_proxy_tuple() -> Optional[Tuple]:
+    return _proxy_tuple_from_config(DYNAMIC_PROXY, context="dynamic")
 
 def proxy_desc(p: Optional[Tuple]) -> str:
     if not p: return "None"
@@ -332,6 +349,10 @@ class AccountWorker:
         self.started = False
         self._keepalive_task: Optional[asyncio.Task] = None
         self.account_name: Optional[str] = None
+        self._proxy_tuple: Optional[Tuple] = None
+        self._proxy_desc: str = proxy_desc(None)
+        self._proxy_dynamic: bool = False
+        self._proxy_override_signature: Optional[str] = None
 
     def _reset_session_state(self) -> None:
         with contextlib.suppress(FileNotFoundError):
@@ -424,10 +445,94 @@ class AccountWorker:
             parse_mode="html",
         )
 
+    def _update_proxy_meta(self) -> None:
+        meta = accounts_meta.setdefault(self.phone, {"phone": self.phone})
+        changed = False
+        if meta.get("proxy_desc") != self._proxy_desc:
+            meta["proxy_desc"] = self._proxy_desc
+            changed = True
+        if meta.get("proxy_dynamic") != self._proxy_dynamic:
+            meta["proxy_dynamic"] = self._proxy_dynamic
+            changed = True
+        if changed:
+            _save(accounts_meta, ACCOUNTS_META)
+
+    def _select_proxy(self, *, force_new: bool = False) -> Optional[Tuple]:
+        meta = accounts_meta.get(self.phone) or {}
+        raw_override = meta.get("proxy_override")
+        override_signature = "__none__"
+        override_cfg: Optional[Dict[str, Any]] = None
+        if raw_override is None:
+            override_signature = "__none__"
+        elif isinstance(raw_override, dict):
+            try:
+                override_signature = json.dumps(raw_override, sort_keys=True, ensure_ascii=False, default=str)
+            except (TypeError, ValueError):
+                override_signature = str(raw_override)
+            override_cfg = raw_override
+        else:
+            override_signature = "__invalid_type__"
+            if self._proxy_override_signature != override_signature:
+                log.warning(
+                    "[%s] proxy_override must be a mapping, got %r. Игнорирую переопределение.",
+                    self.phone,
+                    type(raw_override).__name__,
+                )
+
+        need_refresh = force_new or self._proxy_tuple is None or override_signature != self._proxy_override_signature
+        if not need_refresh:
+            return self._proxy_tuple
+
+        proxy_tuple: Optional[Tuple] = None
+        is_dynamic = False
+
+        if override_cfg is not None:
+            if not bool(override_cfg.get("enabled", True)):
+                proxy_tuple = None
+            else:
+                proxy_tuple = _proxy_tuple_from_config(override_cfg, context=f"account:{self.phone}")
+                if proxy_tuple is None and self._proxy_override_signature != override_signature:
+                    log.warning(
+                        "[%s] proxy_override указано, но конфигурация некорректна. Пытаюсь использовать динамический прокси.",
+                        self.phone,
+                    )
+
+        if proxy_tuple is None and (override_cfg is None or bool(override_cfg.get("enabled", True))):
+            dynamic_tuple = build_dynamic_proxy_tuple()
+            if dynamic_tuple is not None:
+                proxy_tuple = dynamic_tuple
+                is_dynamic = True
+
+        if proxy_tuple is None and override_cfg is not None and bool(override_cfg.get("enabled", True)) and self._proxy_override_signature != override_signature:
+            log.warning(
+                "[%s] proxy_override не удалось применить и динамический прокси отключён. Подключение пойдёт без прокси.",
+                self.phone,
+            )
+
+        self._proxy_tuple = proxy_tuple
+        self._proxy_dynamic = is_dynamic
+        self._proxy_desc = proxy_desc(proxy_tuple)
+        self._proxy_override_signature = override_signature
+        self._update_proxy_meta()
+        return self._proxy_tuple
+
+    @property
+    def proxy_description(self) -> str:
+        if self._proxy_tuple is None:
+            self._select_proxy()
+        return self._proxy_desc
+
+    @property
+    def using_dynamic_proxy(self) -> bool:
+        if self._proxy_tuple is None:
+            self._select_proxy()
+        return self._proxy_dynamic
+
     def _make_client(self) -> TelegramClient:
+        proxy_cfg = self._select_proxy()
         return TelegramClient(
             self.session, self.api_id, self.api_hash,
-            proxy=build_dynamic_proxy_tuple(),
+            proxy=proxy_cfg,
             device_model=self.device.get("device_model"),
             system_version=self.device.get("system_version"),
             app_version=self.device.get("app_version"),
@@ -668,8 +773,12 @@ class AccountWorker:
             f.write(self.client.session.save())
         self._set_session_invalid_flag(False)
         self._set_account_state(None)
-        log.info("[%s] started on %s; device=%s",
-                 self.phone, proxy_desc(build_dynamic_proxy_tuple()), self.device.get("device_model"))
+        log.info(
+            "[%s] started on %s; device=%s",
+            self.phone,
+            self.proxy_description,
+            self.device.get("device_model"),
+        )
 
         # keepalive/reconnect supervisor
         if self._keepalive_task is None:
@@ -753,6 +862,7 @@ class AccountWorker:
                 await self.client.disconnect()
         except Exception:
             pass
+        self._select_proxy(force_new=True)
         self.client = self._make_client()
         await self.start()
 
@@ -1557,14 +1667,17 @@ async def on_text(ev):
                 await ev.reply(f"Не удалось отправить код: {e}")
                 pending.pop(admin_id,None); return
 
-            accounts_meta[phone] = {
-                "phone": phone,
-                "api_id": api["api_id"],
-                "device": dev.get("device_model",""),
-                "session_file": os.path.join(SESSIONS_DIR, f"{phone}.session"),
-                "proxy_dynamic": DYNAMIC_PROXY.get("enabled", False),
-                "proxy_desc": proxy_desc(build_dynamic_proxy_tuple()),
-            }
+            meta = accounts_meta.setdefault(phone, {"phone": phone})
+            meta.update(
+                {
+                    "phone": phone,
+                    "api_id": api["api_id"],
+                    "device": dev.get("device_model", ""),
+                    "session_file": os.path.join(SESSIONS_DIR, f"{phone}.session"),
+                }
+            )
+            meta["proxy_dynamic"] = w.using_dynamic_proxy
+            meta["proxy_desc"] = w.proxy_description
             _save(accounts_meta, ACCOUNTS_META)
 
             pending[admin_id] = {"step":"code","phone":phone,"worker":w}
