@@ -154,6 +154,20 @@ def _ensure_dict(value: Any) -> Dict[str, Any]:
     return {}
 
 
+def _save(d, path):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+
+
+def _load(path, default):
+    if os.path.exists(path):
+        try:
+            return json.load(open(path, "r", encoding="utf-8"))
+        except Exception:
+            return default
+    return default
+
+
 tenants: Dict[str, Dict[str, Any]] = _ensure_dict(_load(TENANTS_DB, {}))
 _tenants_initially_empty = not tenants
 
