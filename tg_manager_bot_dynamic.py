@@ -7,6 +7,7 @@ import sys
 import random
 import secrets
 import html
+import re
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple, Set
 from io import BytesIO
@@ -133,9 +134,10 @@ SESSIONS_DIR = "sessions"; os.makedirs(SESSIONS_DIR, exist_ok=True)
 LIBRARY_DIR = "library"
 PASTES_DIR = os.path.join(LIBRARY_DIR, "pastes")
 VOICES_DIR = os.path.join(LIBRARY_DIR, "voices")
+VIDEO_DIR = os.path.join(LIBRARY_DIR, "video")
 TEXT_EXTENSIONS = {".txt", ".md"}
 VOICE_EXTENSIONS = {".ogg"}
-for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR):
+for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR):
     os.makedirs(_dir, exist_ok=True)
 ASSET_TITLE_MAX = 32
 ACCOUNTS_META = "accounts.json"
@@ -192,6 +194,14 @@ def _list_files(directory: str, allowed_ext: Set[str]) -> List[str]:
             continue
         files.append(full)
     return files
+
+
+def sanitize_filename(name: str, default: str = "file") -> str:
+    """Convert arbitrary text to a safe filename."""
+    cleaned = re.sub(r"[^\w\s.-]", "", name, flags=re.UNICODE).strip()
+    cleaned = re.sub(r"\s+", "_", cleaned)
+    cleaned = cleaned[:64]
+    return cleaned or default
 
 
 def list_text_templates() -> List[str]:
@@ -895,7 +905,17 @@ def main_menu():
     return [
         [Button.inline("➕ Добавить аккаунт", b"add")],
         [Button.inline("📋 Список аккаунтов", b"list")],
+        [Button.inline("📁 Файлы", b"files")],
         [Button.inline("🧪 Ping", b"ping")],
+    ]
+
+
+def files_menu() -> List[List[Button]]:
+    return [
+        [Button.inline("📄 Пасты", b"files_paste")],
+        [Button.inline("🎙 Голосовые", b"files_voice")],
+        [Button.inline("📹 Кружки", b"files_video")],
+        [Button.inline("⬅️ Назад", b"back")],
     ]
 
 def account_control_menu():
@@ -930,6 +950,33 @@ async def on_cb(ev):
     notify_cancel = not data.startswith(("reply",))
     await cancel_operations(admin_id, notify=notify_cancel)
     await ensure_menu_keyboard(admin_id)
+
+    if data == "files":
+        await ev.answer()
+        await bot_client.send_message(
+            admin_id,
+            "Выбери тип файлов для сохранения:",
+            buttons=files_menu(),
+        )
+        return
+
+    if data == "files_paste":
+        pending[admin_id] = {"flow": "file", "file_type": "paste", "step": "name"}
+        await ev.answer()
+        await bot_client.send_message(admin_id, "Введите название пасты:")
+        return
+
+    if data == "files_voice":
+        pending[admin_id] = {"flow": "file", "file_type": "voice", "step": "name"}
+        await ev.answer()
+        await bot_client.send_message(admin_id, "Введите название голосового:")
+        return
+
+    if data == "files_video":
+        pending[admin_id] = {"flow": "file", "file_type": "video", "step": "name"}
+        await ev.answer()
+        await bot_client.send_message(admin_id, "Введите название кружка:")
+        return
 
     if data == "add":
         pending[admin_id] = {"step":"phone"}
@@ -1303,6 +1350,84 @@ async def on_text(ev):
     st = pending.get(admin_id)
 
     if st:
+        if st.get("flow") == "file":
+            file_type = st.get("file_type")
+            if st.get("step") == "name":
+                if not text:
+                    await ev.reply("Название не может быть пустым. Попробуйте снова.")
+                    return
+                filename = sanitize_filename(text, default=file_type or "file")
+                pending[admin_id]["name"] = filename
+                pending[admin_id]["step"] = "content"
+                if file_type == "paste":
+                    await ev.reply("Теперь пришлите текст пасты.")
+                elif file_type == "voice":
+                    await ev.reply(
+                        "Пришлите голосовое сообщение или перешлите готовое."
+                    )
+                elif file_type == "video":
+                    await ev.reply("Пришлите кружок (видео-сообщение).")
+                else:
+                    pending.pop(admin_id, None)
+                    await ev.reply("Неизвестный тип файла. Операция отменена.")
+                return
+
+            if st.get("step") == "content":
+                name = st.get("name") or sanitize_filename("file")
+                if file_type == "paste":
+                    if not text:
+                        await ev.reply("Текст пасты не может быть пустым.")
+                        return
+                    file_path = os.path.join(PASTES_DIR, f"{name}.txt")
+                    try:
+                        with open(file_path, "w", encoding="utf-8") as f:
+                            f.write(text)
+                    except OSError as e:
+                        await ev.reply(f"Не удалось сохранить пасту: {e}")
+                        return
+                    pending.pop(admin_id, None)
+                    await ev.reply(f"✅ Паста сохранена как {os.path.basename(file_path)}")
+                    return
+
+                msg = ev.message
+                if file_type == "voice":
+                    if not getattr(msg, "voice", None):
+                        await ev.reply("Ожидается голосовое сообщение в формате .ogg.")
+                        return
+                    ext = ".ogg"
+                    if msg.file and msg.file.ext:
+                        ext = msg.file.ext
+                    file_path = os.path.join(VOICES_DIR, f"{name}{ext}")
+                    try:
+                        await msg.download_media(file=file_path)
+                    except Exception as e:
+                        await ev.reply(f"Не удалось сохранить голосовое: {e}")
+                        return
+                    pending.pop(admin_id, None)
+                    await ev.reply(f"✅ Голосовое сохранено как {os.path.basename(file_path)}")
+                    return
+
+                if file_type == "video":
+                    if not (getattr(msg, "video_note", None) or getattr(msg, "video", None)):
+                        await ev.reply("Ожидается кружок (видео-сообщение).")
+                        return
+                    ext = ".mp4"
+                    if msg.file and msg.file.ext:
+                        ext = msg.file.ext
+                    file_path = os.path.join(VIDEO_DIR, f"{name}{ext}")
+                    try:
+                        await msg.download_media(file=file_path)
+                    except Exception as e:
+                        await ev.reply(f"Не удалось сохранить кружок: {e}")
+                        return
+                    pending.pop(admin_id, None)
+                    await ev.reply(f"✅ Кружок сохранён как {os.path.basename(file_path)}")
+                    return
+
+                await ev.reply("Неизвестный тип файла. Операция отменена.")
+                pending.pop(admin_id, None)
+                return
+
         if st["step"] == "phone":
             phone = text
             if not phone.startswith("+") or len(phone)<8:
