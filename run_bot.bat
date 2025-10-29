@@ -67,7 +67,7 @@ python -m pip install --upgrade pip || goto :fail
 if exist requirements.txt (
     python -m pip install -r requirements.txt || goto :fail
 ) else (
-    python -m pip install telethon python-socks || goto :fail
+    python -m pip install telethon PySocks || goto :fail
 )
 
 REM --- Запуск бота ---

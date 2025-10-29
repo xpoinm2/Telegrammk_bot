@@ -51,7 +51,7 @@ except ImportError:  # Telethon >= 1.34 moved/renamed the errors
     )
 from telethon.tl.types import PeerUser, User
 
-import socks  # python-socks
+import socks  # PySocks
 
 # ================== LOGGING (console + file) ==================
 LOG_FILE = "bot.log"
