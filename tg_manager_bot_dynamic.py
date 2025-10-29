@@ -8,6 +8,7 @@ import random
 import secrets
 import html
 import re
+import shutil
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple, Set
 from io import BytesIO
@@ -142,6 +143,8 @@ VOICE_EXTENSIONS = {".ogg"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
 for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR):
     os.makedirs(_dir, exist_ok=True)
+ARCHIVE_DIR = "Archive"
+os.makedirs(ARCHIVE_DIR, exist_ok=True)
 ASSET_TITLE_MAX = 32
 ACCOUNTS_META = "accounts.json"
 ROTATION_STATE = ".rotation_state.json"
@@ -278,6 +281,83 @@ def remove_tenant(owner_id: int) -> bool:
     tenants.pop(key, None)
     persist_tenants()
     return True
+
+
+def archive_user_data(user_id: int) -> None:
+    """Перемещает пользовательские каталоги в архив."""
+    dest_base = os.path.join(ARCHIVE_DIR, str(user_id))
+    os.makedirs(dest_base, exist_ok=True)
+    sources = [
+        os.path.join(LIBRARY_DIR, str(user_id)),
+        os.path.join(SESSIONS_DIR, str(user_id)),
+    ]
+    for src in sources:
+        if not os.path.exists(src):
+            continue
+        dst = os.path.join(dest_base, os.path.basename(src))
+        if os.path.exists(dst):
+            shutil.rmtree(dst, ignore_errors=True)
+        try:
+            shutil.move(src, dst)
+        except Exception as exc:  # pragma: no cover - best effort archival
+            log.warning("Не удалось переместить %s в архив: %s", src, exc)
+    # Удаляем пустую папку пользователя в library/sessions, если она осталась
+    for parent in (LIBRARY_DIR, SESSIONS_DIR):
+        path = os.path.join(parent, str(user_id))
+        if os.path.isdir(path) and not os.listdir(path):
+            with contextlib.suppress(OSError):
+                os.rmdir(path)
+
+
+def list_regular_tenants() -> List[Tuple[int, Dict[str, Any]]]:
+    entries: List[Tuple[int, Dict[str, Any]]] = []
+    for key, data in tenants.items():
+        try:
+            user_id = int(key)
+        except (TypeError, ValueError):
+            continue
+        info = data if isinstance(data, dict) else {}
+        role = info.get("role") or "user"
+        if role == "root":
+            continue
+        entries.append((user_id, info))
+    entries.sort(key=lambda item: item[0])
+    return entries
+
+
+def build_user_access_view() -> Tuple[str, Optional[List[List[Button]]]]:
+    tenants_list = list_regular_tenants()
+    if not tenants_list:
+        return (
+            "Нет пользователей с доступом (кроме супер-администраторов).",
+            [[Button.inline("⬅️ Закрыть", b"userlist_close")]],
+        )
+    lines = ["Пользователи с доступом (кроме супер-админов):"]
+    buttons: List[List[Button]] = []
+    for user_id, info in tenants_list:
+        accounts = info.get("accounts")
+        count = len(accounts) if isinstance(accounts, dict) else 0
+        lines.append(f"• {user_id} — {count} аккаунтов")
+        buttons.append(
+            [
+                Button.inline(str(user_id), f"usernoop:{user_id}".encode()),
+                Button.inline("🚫 Блокировать", f"userblock:{user_id}".encode()),
+            ]
+        )
+    buttons.append([Button.inline("⬅️ Закрыть", b"userlist_close")])
+    return "\n".join(lines), buttons
+
+
+async def send_user_access_list(admin_id: int, *, event=None) -> None:
+    text, buttons = build_user_access_view()
+    markup = buttons if buttons else None
+    if event is not None:
+        try:
+            await event.edit(text, buttons=markup)
+            return
+        except Exception as exc:
+            log.warning("Не удалось обновить сообщение списка пользователей: %s", exc)
+    await bot_client.send_message(admin_id, text, buttons=markup)
 
 
 def all_admin_ids() -> Set[int]:
@@ -1288,6 +1368,43 @@ async def on_cb(ev):
     await cancel_operations(admin_id, notify=notify_cancel)
     await ensure_menu_keyboard(admin_id)
 
+    if data.startswith("usernoop:"):
+        _, user_id_str = data.split(":", 1)
+        await ev.answer(f"ID: {user_id_str}")
+        return
+
+    if data == "userlist_close":
+        await ev.answer()
+        with contextlib.suppress(Exception):
+            await ev.edit("Список закрыт.", buttons=None)
+        return
+
+    if data.startswith("userblock:"):
+        if not is_root_admin(admin_id):
+            await ev.answer("Недостаточно прав", alert=True)
+            return
+        try:
+            target_id = int(data.split(":", 1)[1])
+        except (TypeError, ValueError):
+            await ev.answer("Некорректный ID", alert=True)
+            return
+        if is_root_admin(target_id):
+            await ev.answer("Нельзя отключить супер-администратора.", alert=True)
+            return
+        tenant_data = tenants.get(tenant_key(target_id))
+        if not tenant_data:
+            await ev.answer("Пользователь не найден.", alert=True)
+            return
+        await clear_owner_runtime(target_id)
+        archive_user_data(target_id)
+        if remove_tenant(target_id):
+            await safe_send_admin("Ваш доступ к менеджеру отключен.", owner_id=target_id)
+            await send_user_access_list(admin_id, event=ev)
+            await ev.answer("Доступ пользователя отключён и данные архивированы.", alert=True)
+        else:
+            await ev.answer("Не удалось отключить пользователя.", alert=True)
+        return
+
     if data == "files":
         await ev.answer()
         await bot_client.send_message(
@@ -1750,6 +1867,11 @@ async def on_text(ev):
             ensure_tenant(new_id, role=role)
             await ev.respond(f"Доступ выдан пользователю {new_id}. Роль: {role}.")
             await safe_send_admin("Вам выдан доступ к менеджеру. Отправьте /start", owner_id=new_id)
+        elif cmd == "/users":
+            if not is_root_admin(admin_id):
+                await ev.respond("Команда доступна только супер-администратору.")
+                return
+            await send_user_access_list(admin_id)
         elif cmd == "/revoke":
             if not is_root_admin(admin_id):
                 await ev.respond("Команда доступна только супер-администратору.")
