@@ -1222,6 +1222,133 @@ pending: Dict[int, Dict[str, Any]] = {}
 WORKERS: Dict[int, Dict[str, AccountWorker]] = {}
 reply_contexts: Dict[str, Dict[str, Any]] = {}
 reply_waiting: Dict[int, Dict[str, Any]] = {}
+
+
+def _clone_buttons(buttons: Optional[List[List[Button]]]) -> Optional[List[List[Button]]]:
+    if buttons is None:
+        return None
+    return [list(row) for row in buttons]
+
+
+def _clean_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: v for k, v in kwargs.items() if v is not None}
+
+
+def _ensure_back_button(
+    buttons: Optional[List[List[Button]]],
+    session_id: str,
+) -> List[List[Button]]:
+    rows = _clone_buttons(buttons) or []
+    payload = f"ui_back:{session_id}".encode()
+    if any(getattr(btn, "data", None) == payload for row in rows for btn in row):
+        return rows
+    rows.append([Button.inline("⬅️ Назад", payload)])
+    return rows
+
+
+InteractiveViewState = Dict[str, Any]
+interactive_views: Dict[int, Dict[str, Any]] = {}
+
+
+async def show_interactive_message(
+    admin_id: int,
+    text: str,
+    *,
+    buttons: Optional[List[List[Button]]] = None,
+    replace: bool = False,
+    **kwargs: Any,
+) -> None:
+    kwargs_clean = _clean_kwargs(kwargs)
+    current = interactive_views.get(admin_id)
+    if replace and (not current or not current.get("message_id")):
+        replace = False
+
+    if replace and current:
+        session_id = current["session_id"]
+        history: List[InteractiveViewState] = current.setdefault("states", [])
+        rows = _ensure_back_button(buttons, session_id)
+        try:
+            await bot_client.edit_message(
+                admin_id,
+                current["message_id"],
+                text,
+                buttons=rows,
+                **kwargs_clean,
+            )
+        except Exception as e:
+            log.warning("Failed to edit interactive message for %s: %s", admin_id, e)
+            msg = await bot_client.send_message(
+                admin_id,
+                text,
+                buttons=rows,
+                **kwargs_clean,
+            )
+            history.append(
+                {
+                    "text": text,
+                    "buttons": _clone_buttons(rows),
+                    "kwargs": dict(kwargs_clean),
+                }
+            )
+            interactive_views[admin_id] = {
+                "session_id": session_id,
+                "message_id": msg.id,
+                "states": history,
+            }
+        else:
+            history.append(
+                {
+                    "text": text,
+                    "buttons": _clone_buttons(rows),
+                    "kwargs": dict(kwargs_clean),
+                }
+            )
+        return
+
+    session_id = secrets.token_hex(4)
+    rows = _clone_buttons(buttons)
+    msg = await bot_client.send_message(
+        admin_id,
+        text,
+        buttons=rows,
+        **kwargs_clean,
+    )
+    interactive_views[admin_id] = {
+        "session_id": session_id,
+        "message_id": msg.id,
+        "states": [
+            {
+                "text": text,
+                "buttons": _clone_buttons(rows),
+                "kwargs": dict(kwargs_clean),
+            }
+        ],
+    }
+
+
+async def interactive_go_back(admin_id: int, session_id: str) -> Tuple[bool, Optional[str]]:
+    state = interactive_views.get(admin_id)
+    if not state or state.get("session_id") != session_id:
+        return False, "expired"
+    history: List[InteractiveViewState] = state.get("states", [])
+    if len(history) <= 1:
+        return False, "root"
+    history.pop()
+    prev = history[-1]
+    prev_buttons = _clone_buttons(prev.get("buttons"))
+    prev_kwargs = dict(prev.get("kwargs", {}))
+    try:
+        await bot_client.edit_message(
+            admin_id,
+            state["message_id"],
+            prev["text"],
+            buttons=prev_buttons,
+            **prev_kwargs,
+        )
+    except Exception as e:
+        log.warning("Failed to restore interactive view for %s: %s", admin_id, e)
+        return False, "error"
+    return True, None
 MENU_BUTTON_TEXT = "MENU"
 menu_keyboard_shown: Set[int] = set()
 
@@ -1324,9 +1451,21 @@ async def on_cb(ev):
     data = ev.data.decode() if isinstance(ev.data, (bytes, bytearray)) else str(ev.data)
     admin_id = ev.sender_id
 
-    notify_cancel = not data.startswith(("reply",))
+    notify_cancel = not data.startswith(("reply", "ui_back"))
     await cancel_operations(admin_id, notify=notify_cancel)
     await ensure_menu_keyboard(admin_id)
+
+    if data.startswith("ui_back:"):
+        session_id = data.split(":", 1)[1]
+        success, reason = await interactive_go_back(admin_id, session_id)
+        if success:
+            await ev.answer()
+        else:
+            if reason == "expired":
+                await ev.answer("Сообщение устарело", alert=True)
+            else:
+                await ev.answer("Возврат недоступен", alert=True)
+        return
 
     if data.startswith("usernoop:"):
         _, user_id_str = data.split(":", 1)
@@ -1534,7 +1673,7 @@ async def on_cb(ev):
         await ev.answer()
         ctx_info = reply_contexts[ctx]
         hint_suffix = " (будет отправлено как reply)." if mode == "reply" else "."
-        await bot_client.send_message(
+        await show_interactive_message(
             admin_id,
             (
                 f"Ответ для {ctx_info['phone']} (chat_id {ctx_info['chat_id']}): "
@@ -1607,10 +1746,11 @@ async def on_cb(ev):
             await ev.answer(empty_text, alert=True)
             return
         await ev.answer()
-        await bot_client.send_message(
+        await show_interactive_message(
             admin_id,
             title,
             buttons=build_asset_keyboard(files, prefix, ctx, mode),
+            replace=True,
         )
         return
     
@@ -2091,7 +2231,10 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
-    except Exception:
+    except Exception:pending: Dict[int, Dict[str, Any]] = {}
+WORKERS: Dict[int, Dict[str, AccountWorker]] = {}
+reply_contexts: Dict[str, Dict[str, Any]] = {}
+reply_waiting: Dict[int, Dict[str, Any]] = {}
         import traceback
         traceback.print_exc()
         print("\nОШИБКА! Смотри трейс выше и файл bot.log.")
