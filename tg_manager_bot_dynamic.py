@@ -12,7 +12,7 @@ import shutil
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple, Set
 from io import BytesIO
-from telethon import TelegramClient, events, Button
+from telethon import TelegramClient, events, Button, functions
 from telethon.utils import get_display_name
 from telethon.sessions import StringSession
 from telethon.errors import (
@@ -50,7 +50,6 @@ except ImportError:  # Telethon >= 1.34 moved/renamed the errors
         UserDeactivatedBanError,
         PhoneNumberBannedError,
     )
-from telethon.tl.types import PeerUser, User
 
 import socks  # PySocks
 
@@ -866,90 +865,15 @@ class AccountWorker:
                     sender_entity = await ev.get_sender()
                 sender_name = get_display_name(sender_entity) if sender_entity else None
                 sender_username = getattr(sender_entity, "username", None) if sender_entity else None
-                sender_tag = f"@{sender_username}" if sender_username else (
-                    f"ID: {ev.sender_id}" if ev.sender_id else "ID: unknown"
-                )            
-                avatar_bytes: Optional[bytes] = None
-                if sender_entity:
-                    try:
-                        buffer = BytesIO()
-                        result = await self.client.download_profile_photo(sender_entity, file=buffer)
-                        if isinstance(result, BytesIO):
-                            avatar_bytes = result.getvalue()
-                        elif isinstance(result, bytes):
-                            avatar_bytes = result
-                        else:
-                            data = buffer.getvalue()
-                            avatar_bytes = data if data else None
-                    except Exception:
-                        avatar_bytes = None
-
-                if sender_username:
-                    profile_url = f"https://t.me/{sender_username}"
-                elif ev.sender_id:
-                    profile_url = f"tg://user?id={ev.sender_id}"
-                else:
-                    profile_url = None
-
-                if sender_name:
-                    link_label = sender_name
-                elif sender_username:
-                    link_label = f"@{sender_username}"
-                else:
-                    link_label = sender_tag
-
-                forward_anchor = None
-                forward_header = getattr(ev, "forward", None) or getattr(ev, "fwd_from", None)
-                if forward_header:
-                    forward_label: Optional[str] = None
-                    forward_profile_url: Optional[str] = None
-                    forward_username: Optional[str] = None
-                    forward_id: Optional[int] = None
-                    forward_entity = None
-                    from_peer = getattr(forward_header, "from_id", None)
-                    if from_peer:
-                        with contextlib.suppress(Exception):
-                            forward_entity = await self.client.get_entity(from_peer)
-                    if forward_entity:
-                        forward_label = get_display_name(forward_entity) or None
-                        forward_username = getattr(forward_entity, "username", None)
-                        if isinstance(forward_entity, User):
-                            forward_id = getattr(forward_entity, "id", None)
-                    if isinstance(from_peer, PeerUser) and not forward_id:
-                        forward_id = from_peer.user_id
-                    if not forward_label:
-                        forward_label = getattr(forward_header, "from_name", None)
-                    if not forward_username and forward_entity:
-                        forward_username = getattr(forward_entity, "username", None)
-                    if forward_username:
-                        forward_profile_url = f"https://t.me/{forward_username}"
-                    elif forward_id:
-                        forward_profile_url = f"tg://user?id={forward_id}"
-                    if not forward_label:
-                        if forward_username:
-                            forward_label = f"@{forward_username}"
-                        elif forward_id:
-                            forward_label = f"ID: {forward_id}"
-                    if forward_label:
-                        if forward_profile_url:
-                            forward_anchor = (
-                                f"<a href=\"{html.escape(forward_profile_url)}\">{html.escape(forward_label)}</a>"
-                            )
-                        else:
-                            forward_anchor = html.escape(forward_label)
-                if not forward_anchor:
-                    if profile_url:
-                        forward_anchor = f"<a href=\"{html.escape(profile_url)}\">{html.escape(link_label)}</a>"
-                    else:
-                        forward_anchor = html.escape(link_label)
+                tag_value = f"@{sender_username}" if sender_username else "hidden"
+                sender_id_display = str(ev.sender_id) if ev.sender_id is not None else "unknown"
 
                 info_lines = [
                     f"👤 Аккаунт: <b>{html.escape(account_display)}</b>",
                     f"👥 Собеседник: <b>{html.escape(sender_name) if sender_name else '—'}</b>",
-                    f"🔗 {html.escape(sender_tag)}",
+                    f"🔗 {html.escape(tag_value)}",
+                    f"ID Собеседника: {html.escape(sender_id_display)}",
                 ]
-                if forward_anchor:
-                    info_lines.extend(["", f"Forwarded from {forward_anchor}"])
                 if txt:
                     escaped_txt = html.escape(txt)
                     info_lines.extend([
@@ -971,33 +895,16 @@ class AccountWorker:
                     [
                         Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
                         Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
-                        Button.inline("📹 Кружок", f"video_menu:{ctx_id}".encode()),
                     ],
-                    [
-                        Button.inline("📄 Пасты", f"paste_menu:{ctx_id}".encode()),
-                        Button.inline("🎙 Голосовые", f"voice_menu:{ctx_id}".encode()),
-                    ],
+                    [Button.inline("🚫 Заблокировать", f"block_contact:{ctx_id}".encode())],
                 ]
-                if profile_url:
-                    buttons.append([Button.url("🔗 Открыть профиль", profile_url)])
-
-                if avatar_bytes:
-                    await safe_send_admin_file(
-                        avatar_bytes,
-                        filename=f"avatar_{ev.sender_id or 'unknown'}.jpg",
-                        caption=info_caption,
-                        buttons=buttons,
-                        parse_mode="html",
-                        owner_id=self.owner_id,
-                    )
-                else:
-                    await safe_send_admin(
-                        info_caption,
-                        buttons=buttons,
-                        parse_mode="html",
-                        link_preview=False,
-                        owner_id=self.owner_id,
-                    )
+                await safe_send_admin(
+                    info_caption,
+                    buttons=buttons,
+                    parse_mode="html",
+                    link_preview=False,
+                    owner_id=self.owner_id,
+                )
 
             await self.client.start()
         except AuthKeyDuplicatedError as e:
@@ -1220,6 +1127,59 @@ class AccountWorker:
         except UserDeactivatedError as e:
             await self._handle_account_disabled("frozen", e)
             raise RuntimeError("Аккаунт заморожен Telegram")
+        
+    async def block_contact(
+        self,
+        chat_id: int,
+        peer: Optional[Any] = None,
+    ) -> None:
+        client = await self._ensure_client()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Аккаунт не авторизован")
+        if peer is None:
+            try:
+                peer = await client.get_input_entity(chat_id)
+            except Exception:
+                peer = chat_id
+        try:
+            input_peer = await client.get_input_entity(peer)
+        except Exception:
+            input_peer = peer
+        try:
+            await client(functions.contacts.BlockRequest(id=input_peer))
+        except FloodWaitError as e:
+            wait = getattr(e, "seconds", getattr(e, "value", 0))
+            raise RuntimeError(f"Flood wait {wait}s при блокировке") from e
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise RuntimeError("Аккаунт заблокирован Telegram") from e
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise RuntimeError("Аккаунт заморожен Telegram") from e
+        except Exception as e:
+            log.warning("[%s] не удалось заблокировать контакт %s: %s", self.phone, chat_id, e)
+        try:
+            await client(
+                functions.messages.DeleteHistoryRequest(
+                    peer=input_peer,
+                    max_id=0,
+                    just_clear=False,
+                    revoke=True,
+                )
+            )
+        except FloodWaitError as e:
+            wait = getattr(e, "seconds", getattr(e, "value", 0))
+            raise RuntimeError(f"Flood wait {wait}s при удалении диалога") from e
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise RuntimeError("Аккаунт заблокирован Telegram") from e
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise RuntimeError("Аккаунт заморожен Telegram") from e
+        except Exception as e:
+            raise RuntimeError(f"Не удалось удалить диалог: {e}") from e
+        with contextlib.suppress(Exception):
+            await client.delete_dialog(input_peer)
 
     async def _keepalive(self):
         """Поддержание соединения: по ошибкам — reconnect; по таймеру (если включён) — тоже."""
@@ -1590,6 +1550,32 @@ async def on_cb(ev):
         await bot_client.send_message(admin_id, "❌ Ответ отменён.")
         return
 
+    if data.startswith("block_contact:"):
+        ctx = data.split(":", 1)[1]
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        worker = get_worker(admin_id, ctx_info["phone"])
+        if not worker:
+            await ev.answer("Аккаунт недоступен", alert=True)
+            return
+        await ev.answer()
+        try:
+            await worker.block_contact(ctx_info["chat_id"], ctx_info.get("peer"))
+        except Exception as e:
+            await bot_client.send_message(
+                admin_id,
+                f"❌ Не удалось заблокировать собеседника: {e}",
+            )
+        else:
+            reply_contexts.pop(ctx, None)
+            await bot_client.send_message(
+                admin_id,
+                "🚫 Собеседник заблокирован. Диалог удалён для обеих сторон.",
+            )
+        return
+
 
     if data.startswith(("reply_paste_menu:", "reply_voice_menu:", "reply_video_menu:")):
         parts = data.split(":", 2)
@@ -1628,24 +1614,6 @@ async def on_cb(ev):
         )
         return
     
-    if data.startswith("paste_menu:"):
-        ctx = data.split(":", 1)[1]
-        ctx_info = get_reply_context_for_admin(ctx, admin_id)
-        if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
-            return
-        files = list_text_templates(admin_id)
-        if not files:
-            await ev.answer("Папка с пастами пуста", alert=True)
-            return
-        await ev.answer()
-        await bot_client.send_message(
-            admin_id,
-            "📄 Выбери пасту для отправки:",
-            buttons=build_asset_keyboard(files, "paste_send", ctx),
-        )
-        return
-
     if data.startswith("paste_send:"):
         parts = data.split(":")
         if len(parts) not in (3, 4):
@@ -1700,24 +1668,6 @@ async def on_cb(ev):
         await bot_client.send_message(admin_id, "✅ Паста отправлена собеседнику.")
         return
 
-    if data.startswith("voice_menu:"):
-        ctx = data.split(":", 1)[1]
-        ctx_info = get_reply_context_for_admin(ctx, admin_id)
-        if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
-            return
-        files = list_voice_templates(admin_id)
-        if not files:
-            await ev.answer("Папка с голосовыми пуста", alert=True)
-            return
-        await ev.answer()
-        await bot_client.send_message(
-            admin_id,
-            "🎙 Выбери голосовое сообщение:",
-            buttons=build_asset_keyboard(files, "voice_send", ctx),
-        )
-        return
-
     if data.startswith("voice_send:"):
         parts = data.split(":")
         if len(parts) not in (3, 4):
@@ -1761,24 +1711,6 @@ async def on_cb(ev):
             return
         await ev.answer("✅ Голосовое отправлено")
         await bot_client.send_message(admin_id, "✅ Голосовое сообщение отправлено собеседнику.")
-        return
-
-    if data.startswith("video_menu:"):
-        ctx = data.split(":", 1)[1]
-        ctx_info = get_reply_context_for_admin(ctx, admin_id)
-        if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
-            return
-        files = list_video_templates(admin_id)
-        if not files:
-            await ev.answer("Папка с кружками пуста", alert=True)
-            return
-        await ev.answer()
-        await bot_client.send_message(
-            admin_id,
-            "📹 Выбери кружок для отправки:",
-            buttons=build_asset_keyboard(files, "video_send", ctx),
-        )
         return
 
     if data.startswith("video_send:"):
