@@ -2231,10 +2231,7 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         pass
-    except Exception:pending: Dict[int, Dict[str, Any]] = {}
-WORKERS: Dict[int, Dict[str, AccountWorker]] = {}
-reply_contexts: Dict[str, Dict[str, Any]] = {}
-reply_waiting: Dict[int, Dict[str, Any]] = {}
+    except Exception:
         import traceback
         traceback.print_exc()
         print("\nОШИБКА! Смотри трейс выше и файл bot.log.")
