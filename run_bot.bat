@@ -37,6 +37,14 @@ echo Используется Python: %PYTHON_CMD%
 )
 
 REM --- Создание и активация виртуального окружения ---
+if exist venv (
+    if not exist venv\Scripts\python.exe (
+        echo.
+        echo Обнаружено повреждённое виртуальное окружение, удаляем...
+        rmdir /s /q venv || goto :fail
+    )
+)
+
 if not exist venv (
     echo.
     echo Создаётся виртуальное окружение...
