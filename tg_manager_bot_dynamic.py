@@ -81,7 +81,8 @@ API_KEYS = [
 ]
 
 BOT_TOKEN = "8377353888:AAFj_l3l1XAie5RA8PMwxD1gXtb2eEDOdJw"   # токен бота от @BotFather
-ADMIN_IDS = {8099997426, 7519364639}   # набор user id админов
+# Изначальные супер-администраторы, которые могут выдавать доступ другим пользователям
+ROOT_ADMIN_IDS = {8099997426, 7519364639}
 
 # ДИНАМИЧЕСКИЙ ПРОКСИ: одна точка, новый IP выдаётся провайдером при новом соединении
 # Если боту прокси не нужен — enabled=False
@@ -132,6 +133,7 @@ DEVICE_PROFILES: List[Dict[str, str]] = [
 
 SESSIONS_DIR = "sessions"; os.makedirs(SESSIONS_DIR, exist_ok=True)
 LIBRARY_DIR = "library"
+# Директории будут создаваться внутри каталога пользователя
 PASTES_DIR = os.path.join(LIBRARY_DIR, "pastes")
 VOICES_DIR = os.path.join(LIBRARY_DIR, "voices")
 VIDEO_DIR = os.path.join(LIBRARY_DIR, "video")
@@ -143,6 +145,159 @@ for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR):
 ASSET_TITLE_MAX = 32
 ACCOUNTS_META = "accounts.json"
 ROTATION_STATE = ".rotation_state.json"
+TENANTS_DB = "tenants.json"
+
+
+def _ensure_dict(value: Any) -> Dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+tenants: Dict[str, Dict[str, Any]] = _ensure_dict(_load(TENANTS_DB, {}))
+_tenants_initially_empty = not tenants
+
+
+def persist_tenants() -> None:
+    _save(tenants, TENANTS_DB)
+
+
+def tenant_key(user_id: int) -> str:
+    return str(int(user_id))
+
+
+def ensure_user_dirs(user_id: int) -> None:
+    base = os.path.join(LIBRARY_DIR, str(user_id))
+    os.makedirs(base, exist_ok=True)
+    for sub in ("pastes", "voices", "video"):
+        os.makedirs(os.path.join(base, sub), exist_ok=True)
+    os.makedirs(os.path.join(SESSIONS_DIR, str(user_id)), exist_ok=True)
+
+
+def user_library_dir(user_id: int, kind: str) -> str:
+    ensure_user_dirs(user_id)
+    return os.path.join(LIBRARY_DIR, str(user_id), kind)
+
+
+def user_sessions_dir(user_id: int) -> str:
+    ensure_user_dirs(user_id)
+    return os.path.join(SESSIONS_DIR, str(user_id))
+
+
+def user_session_path(user_id: int, phone: str) -> str:
+    return os.path.join(user_sessions_dir(user_id), f"{phone}.session")
+
+
+def ensure_tenant(user_id: int, *, role: str = "user") -> Dict[str, Any]:
+    key = tenant_key(user_id)
+    data = tenants.setdefault(key, {})
+    if data.get("role") not in {"root", "user"}:
+        data["role"] = role
+    elif role == "root" and data.get("role") != "root":
+        data["role"] = "root"
+    data.setdefault("accounts", {})
+    data.setdefault("rotation_state", {})
+    ensure_user_dirs(user_id)
+    persist_tenants()
+    return data
+
+
+def get_tenant(user_id: int) -> Dict[str, Any]:
+    key = tenant_key(user_id)
+    if key not in tenants:
+        return ensure_tenant(user_id)
+    ensure_user_dirs(user_id)
+    data = tenants[key]
+    data.setdefault("accounts", {})
+    data.setdefault("rotation_state", {})
+    return data
+
+
+def get_accounts_meta(owner_id: int) -> Dict[str, Dict[str, Any]]:
+    return get_tenant(owner_id).setdefault("accounts", {})
+
+
+def get_rotation_state(owner_id: int) -> Dict[str, int]:
+    tenant = get_tenant(owner_id)
+    rotation = tenant.setdefault("rotation_state", {})
+    if not isinstance(rotation, dict):
+        rotation = {}
+        tenant["rotation_state"] = rotation
+        persist_tenants()
+    return rotation
+
+
+def get_account_meta(owner_id: int, phone: str) -> Optional[Dict[str, Any]]:
+    accounts = get_accounts_meta(owner_id)
+    return accounts.get(phone)
+
+
+def ensure_account_meta(owner_id: int, phone: str) -> Dict[str, Any]:
+    accounts = get_accounts_meta(owner_id)
+    meta = accounts.setdefault(phone, {"phone": phone})
+    return meta
+
+
+async def clear_owner_runtime(owner_id: int) -> None:
+    owner_workers = WORKERS.pop(owner_id, {})
+    for worker in owner_workers.values():
+        with contextlib.suppress(Exception):
+            await worker.logout()
+    pending.pop(owner_id, None)
+    reply_waiting.pop(owner_id, None)
+    menu_keyboard_shown.discard(owner_id)
+    for ctx_id, ctx in list(reply_contexts.items()):
+        if ctx.get("owner_id") == owner_id:
+            reply_contexts.pop(ctx_id, None)
+            for admin_key, waiting_ctx in list(reply_waiting.items()):
+                if waiting_ctx.get("ctx") == ctx_id:
+                    reply_waiting.pop(admin_key, None)
+
+
+def remove_tenant(owner_id: int) -> bool:
+    key = tenant_key(owner_id)
+    data = tenants.get(key)
+    if not data:
+        return False
+    if data.get("role") == "root" and owner_id in ROOT_ADMIN_IDS:
+        return False
+    tenants.pop(key, None)
+    persist_tenants()
+    return True
+
+
+def all_admin_ids() -> Set[int]:
+    ids: Set[int] = set()
+    for key in tenants.keys():
+        try:
+            ids.add(int(key))
+        except (TypeError, ValueError):
+            continue
+    return ids
+
+
+def is_root_admin(user_id: int) -> bool:
+    data = tenants.get(tenant_key(user_id))
+    if not data:
+        return False
+    return data.get("role") == "root"
+
+
+for root_id in ROOT_ADMIN_IDS:
+    ensure_tenant(root_id, role="root")
+
+
+# переносим данные из старых файлов, если это первый запуск новой схемы
+if _tenants_initially_empty:
+    legacy_accounts = _ensure_dict(_load(ACCOUNTS_META, {}))
+    legacy_rotation = _ensure_dict(_load(ROTATION_STATE, {}))
+    if legacy_accounts and ROOT_ADMIN_IDS:
+        fallback_owner = next(iter(ROOT_ADMIN_IDS))
+        tenant = ensure_tenant(fallback_owner, role="root")
+        tenant["accounts"] = legacy_accounts
+        tenant["rotation_state"] = legacy_rotation
+        persist_tenants()
+
 # Параметры имитации активности перед отправкой
 TYPING_CHAR_SPEED = (7.0, 14.0)  # символов в секунду
 TYPING_DURATION_LIMITS = (0.6, 4.0)  # минимальная и максимальная продолжительность «печати»
@@ -206,16 +361,16 @@ def sanitize_filename(name: str, default: str = "file") -> str:
     return cleaned or default
 
 
-def list_text_templates() -> List[str]:
-    return _list_files(PASTES_DIR, TEXT_EXTENSIONS)
+def list_text_templates(owner_id: int) -> List[str]:
+    return _list_files(user_library_dir(owner_id, "pastes"), TEXT_EXTENSIONS)
 
 
-def list_voice_templates() -> List[str]:
-    return _list_files(VOICES_DIR, VOICE_EXTENSIONS)
+def list_voice_templates(owner_id: int) -> List[str]:
+    return _list_files(user_library_dir(owner_id, "voices"), VOICE_EXTENSIONS)
 
 
-def list_video_templates() -> List[str]:
-    return _list_files(VIDEO_DIR, VIDEO_EXTENSIONS)
+def list_video_templates(owner_id: int) -> List[str]:
+    return _list_files(user_library_dir(owner_id, "video"), VIDEO_EXTENSIONS)
 
 
 def build_asset_keyboard(
@@ -246,14 +401,12 @@ def build_reply_options_keyboard(ctx: str, mode: str) -> List[List[Button]]:
         [Button.inline("❌ Отмена", f"reply_cancel:{ctx}".encode())],
     ]
 
-rotation_state: Dict[str,int] = _load(ROTATION_STATE, {})
-accounts_meta: Dict[str,Dict[str,Any]] = _load(ACCOUNTS_META, {})
-
-def next_index(key: str, length: int) -> int:
+def next_index(owner_id: int, key: str, length: int) -> int:
+    rotation_state = get_rotation_state(owner_id)
     cur = rotation_state.get(key, -1)
     cur = (cur + 1) % max(1, length)
     rotation_state[key] = cur
-    _save(rotation_state, ROTATION_STATE)
+    persist_tenants()
     return cur
 
 # ---- bot client ----
@@ -266,11 +419,12 @@ bot_client = TelegramClient(
 
 # безопасная отправка админу (не падаем, если админ ещё не нажал /start)
 def is_admin(user_id: int) -> bool:
-    return user_id in ADMIN_IDS
+    return tenant_key(user_id) in tenants
 
 
-async def safe_send_admin(text: str, **kwargs):
-    for admin_id in ADMIN_IDS:
+async def safe_send_admin(text: str, *, owner_id: Optional[int] = None, **kwargs):
+    targets = {owner_id} if owner_id is not None else all_admin_ids()
+    for admin_id in targets:
         try:
             await bot_client.send_message(admin_id, text, **kwargs)
         except Exception as e:
@@ -282,10 +436,11 @@ async def safe_send_admin(text: str, **kwargs):
             continue
 
 
-async def safe_send_admin_file(file_data: bytes, filename: str, **kwargs) -> None:
+async def safe_send_admin_file(file_data: bytes, filename: str, *, owner_id: Optional[int] = None, **kwargs) -> None:
     if not file_data:
         return
-    for admin_id in ADMIN_IDS:
+    targets = {owner_id} if owner_id is not None else all_admin_ids()
+    for admin_id in targets:
         try:
             bio = BytesIO(file_data)
             bio.name = filename
@@ -338,12 +493,13 @@ def proxy_desc(p: Optional[Tuple]) -> str:
 
 # ---- worker ----
 class AccountWorker:
-    def __init__(self, phone: str, api_id: int, api_hash: str, device: Dict[str,str], session_str: Optional[str]):
+    def __init__(self, owner_id: int, phone: str, api_id: int, api_hash: str, device: Dict[str,str], session_str: Optional[str]):
+        self.owner_id = owner_id
         self.phone = phone
         self.api_id = api_id
         self.api_hash = api_hash
         self.device = device
-        self.session_file = os.path.join(SESSIONS_DIR, f"{phone}.session")
+        self.session_file = user_session_path(owner_id, phone)
         self.session = StringSession(session_str) if session_str else StringSession()
         self.client: Optional[TelegramClient] = None
         self.started = False
@@ -360,7 +516,7 @@ class AccountWorker:
         self.session = StringSession()
 
     def _set_session_invalid_flag(self, invalid: bool) -> None:
-        meta = accounts_meta.get(self.phone)
+        meta = get_account_meta(self.owner_id, self.phone)
         if not meta:
             return
         changed = False
@@ -372,10 +528,10 @@ class AccountWorker:
             if meta.pop("session_invalid", None) is not None:
                 changed = True
         if changed:
-            _save(accounts_meta, ACCOUNTS_META)
+            persist_tenants()
 
     def _set_account_state(self, state: Optional[str], details: Optional[str] = None) -> None:
-        meta = accounts_meta.get(self.phone)
+        meta = get_account_meta(self.owner_id, self.phone)
         if not meta:
             return
         changed = False
@@ -394,12 +550,12 @@ class AccountWorker:
             if meta.pop("state_note", None) is not None:
                 changed = True
         if changed:
-            _save(accounts_meta, ACCOUNTS_META)
+            persist_tenants()
 
     async def _handle_account_disabled(self, state: str, error: Exception) -> None:
         human = "заморожен" if state == "frozen" else "заблокирован"
         log.warning("[%s] account %s by Telegram: %s", self.phone, human, error)
-        meta = accounts_meta.get(self.phone) or {}
+        meta = get_account_meta(self.owner_id, self.phone) or {}
         prev_state = meta.get("state")
         prev_note = meta.get("state_note")
         self._set_account_state(state, str(error))
@@ -417,6 +573,7 @@ class AccountWorker:
                     f"⛔️ <b>{self.phone}</b>: аккаунт {human} Telegram.\n"
                     f"Ответ: <code>{error}</code>"
                 ),
+                owner_id=self.owner_id,
                 parse_mode="html",
             )
 
@@ -436,17 +593,18 @@ class AccountWorker:
         self.started = False
         self._reset_session_state()
         self._set_session_invalid_flag(True)
-        WORKERS.pop(self.phone, None)
+        unregister_worker(self.owner_id, self.phone)
         await safe_send_admin(
             (
                 f"⚠️ <b>{self.phone}</b>: Telegram аннулировал сессию из-за одновременного"
                 " входа с разных IP. Добавь аккаунт заново, чтобы получить новую сессию."
             ),
+            owner_id=self.owner_id,
             parse_mode="html",
         )
 
     def _update_proxy_meta(self) -> None:
-        meta = accounts_meta.setdefault(self.phone, {"phone": self.phone})
+        meta = ensure_account_meta(self.owner_id, self.phone)
         changed = False
         if meta.get("proxy_desc") != self._proxy_desc:
             meta["proxy_desc"] = self._proxy_desc
@@ -455,10 +613,10 @@ class AccountWorker:
             meta["proxy_dynamic"] = self._proxy_dynamic
             changed = True
         if changed:
-            _save(accounts_meta, ACCOUNTS_META)
+            persist_tenants()
 
     def _select_proxy(self, *, force_new: bool = False) -> Optional[Tuple]:
-        meta = accounts_meta.get(self.phone) or {}
+        meta = get_account_meta(self.owner_id, self.phone) or {}
         raw_override = meta.get("proxy_override")
         override_signature = "__none__"
         override_cfg: Optional[Dict[str, Any]] = None
@@ -593,9 +751,7 @@ class AccountWorker:
             except Exception:
                 self.account_name = None
 
-            meta = accounts_meta.get(self.phone)
-            if meta is None:
-                meta = accounts_meta[self.phone] = {"phone": self.phone}
+            meta = ensure_account_meta(self.owner_id, self.phone)
             changed = False
             if self.account_name:
                 if meta.get("full_name") != self.account_name:
@@ -605,7 +761,7 @@ class AccountWorker:
                 if meta.pop("full_name", None) is not None:
                     changed = True
             if changed:
-                _save(accounts_meta, ACCOUNTS_META)
+                persist_tenants()
 
             @self.client.on(events.NewMessage(incoming=True))
             async def on_new(ev):
@@ -619,7 +775,8 @@ class AccountWorker:
                         peer = await ev.get_input_sender()
                     except Exception:
                         peer = None
-                account_display = self.account_name or accounts_meta.get(self.phone, {}).get("full_name")
+                account_meta = get_account_meta(self.owner_id, self.phone) or {}
+                account_display = self.account_name or account_meta.get("full_name")
                 if not account_display:
                     account_display = self.phone
                 sender_entity = None
@@ -721,6 +878,7 @@ class AccountWorker:
                 info_caption = "\n".join(info_lines)
 
                 reply_contexts[ctx_id] = {
+                    "owner_id": self.owner_id,
                     "phone": self.phone,
                     "chat_id": ev.chat_id,
                     "sender_id": ev.sender_id,
@@ -748,6 +906,7 @@ class AccountWorker:
                         caption=info_caption,
                         buttons=buttons,
                         parse_mode="html",
+                        owner_id=self.owner_id,
                     )
                 else:
                     await safe_send_admin(
@@ -755,6 +914,7 @@ class AccountWorker:
                         buttons=buttons,
                         parse_mode="html",
                         link_preview=False,
+                        owner_id=self.owner_id,
                     )
 
             await self.client.start()
@@ -1017,11 +1177,37 @@ class AccountWorker:
 
 # ---- runtime ----
 pending: Dict[int, Dict[str, Any]] = {}
-WORKERS: Dict[str, AccountWorker] = {}
+WORKERS: Dict[int, Dict[str, AccountWorker]] = {}
 reply_contexts: Dict[str, Dict[str, Any]] = {}
 reply_waiting: Dict[int, Dict[str, Any]] = {}
 MENU_BUTTON_TEXT = "MENU"
 menu_keyboard_shown: Set[int] = set()
+
+
+def get_worker(owner_id: int, phone: str) -> Optional[AccountWorker]:
+    return WORKERS.get(owner_id, {}).get(phone)
+
+
+def register_worker(owner_id: int, phone: str, worker: AccountWorker) -> None:
+    WORKERS.setdefault(owner_id, {})[phone] = worker
+
+
+def unregister_worker(owner_id: int, phone: str) -> None:
+    owner_workers = WORKERS.get(owner_id)
+    if not owner_workers:
+        return
+    owner_workers.pop(phone, None)
+    if not owner_workers:
+        WORKERS.pop(owner_id, None)
+
+
+def get_reply_context_for_admin(ctx_id: str, admin_id: int) -> Optional[Dict[str, Any]]:
+    ctx = reply_contexts.get(ctx_id)
+    if not ctx:
+        return None
+    if ctx.get("owner_id") != admin_id:
+        return None
+    return ctx
 
 async def cancel_operations(admin_id: int, notify: bool = True) -> bool:
     """Сбрасывает незавершённые операции для конкретного админа."""
@@ -1074,9 +1260,9 @@ def account_control_menu():
         [Button.inline("⬅️ Назад", b"back")],
     ]
 
-def build_account_buttons(prefix: str) -> List[List[Button]]:
+def build_account_buttons(owner_id: int, prefix: str) -> List[List[Button]]:
     rows: List[List[Button]] = []
-    for phone in list(accounts_meta.keys()):
+    for phone in list(get_accounts_meta(owner_id).keys()):
         rows.append([Button.inline(phone, f"{prefix}:{phone}".encode())])
     rows.append([Button.inline("⬅️ Назад", b"list")])
     return rows
@@ -1133,11 +1319,12 @@ async def on_cb(ev):
         return
 
     if data == "list":
-        if not accounts_meta:
+        accounts = get_accounts_meta(admin_id)
+        if not accounts:
             await ev.answer("Пусто", alert=True); await bot_client.send_message(admin_id, "Аккаунтов нет."); return
         lines = ["Аккаунты:"]
-        for p,m in accounts_meta.items():
-            worker = WORKERS.get(p)
+        for p, m in accounts.items():
+            worker = get_worker(admin_id, p)
             active = bool(worker and worker.started)
             state = m.get("state")
             note_extra = ""
@@ -1171,47 +1358,54 @@ async def on_cb(ev):
         return
 
     if data == "del_select":
-        if not accounts_meta:
+        if not get_accounts_meta(admin_id):
             await ev.answer("Нет аккаунтов", alert=True); return
         await ev.answer()
-        await bot_client.send_message(admin_id, "Выбери аккаунт для удаления:", buttons=build_account_buttons("del_do"))
+        await bot_client.send_message(
+            admin_id,
+            "Выбери аккаунт для удаления:",
+            buttons=build_account_buttons(admin_id, "del_do"),
+        )
         return
 
     if data == "val_select":
-        if not accounts_meta:
+        if not get_accounts_meta(admin_id):
             await ev.answer("Нет аккаунтов", alert=True); return
         await ev.answer()
-        await bot_client.send_message(admin_id, "Выбери аккаунт для проверки:", buttons=build_account_buttons("val_do"))
+        await bot_client.send_message(
+            admin_id,
+            "Выбери аккаунт для проверки:",
+            buttons=build_account_buttons(admin_id, "val_do"),
+        )
         return
 
     if data.startswith("del_do:"):
         phone = data.split(":", 1)[1]
-        worker = WORKERS.get(phone)
+        worker = get_worker(admin_id, phone)
         await ev.answer()
         if worker:
             await worker.logout()
-            WORKERS.pop(phone, None)
+            unregister_worker(admin_id, phone)
         for ctx_key, ctx_val in list(reply_contexts.items()):
-            if ctx_val.get("phone") == phone:
+            if ctx_val.get("phone") == phone and ctx_val.get("owner_id") == admin_id:
                 reply_contexts.pop(ctx_key, None)
                 for admin_key, waiting_ctx in list(reply_waiting.items()):
                     if waiting_ctx.get("ctx") == ctx_key:
                         reply_waiting.pop(admin_key, None)
-        meta = accounts_meta.pop(phone, None)
-        _save(accounts_meta, ACCOUNTS_META)
+        accounts = get_accounts_meta(admin_id)
+        meta = accounts.pop(phone, None)
+        persist_tenants()
         if meta and meta.get("session_file") and os.path.exists(meta["session_file"]):
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(meta["session_file"])
-            except OSError:
-                pass
         await bot_client.send_message(admin_id, f"🗑 Аккаунт {phone} удалён.", buttons=main_menu())
         return
 
     if data.startswith("val_do:"):
         phone = data.split(":", 1)[1]
-        worker = WORKERS.get(phone)
+        worker = get_worker(admin_id, phone)
         await ev.answer()
-        meta = accounts_meta.get(phone, {})
+        meta = get_account_meta(admin_id, phone) or {}
         state = meta.get("state")
         if not worker:
             if state == "banned":
@@ -1277,27 +1471,30 @@ async def on_cb(ev):
         await bot_client.send_message(admin_id, "❌ Ответ отменён.")
         return
 
+
     if data.startswith(("reply_paste_menu:", "reply_voice_menu:", "reply_video_menu:")):
         parts = data.split(":", 2)
         if len(parts) != 3:
             await ev.answer("Некорректные данные", alert=True)
             return
         _, ctx, mode = parts
-        if ctx not in reply_contexts:
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
+        owner_for_ctx = ctx_info["owner_id"]
         if data.startswith("reply_paste_menu:"):
-            files = list_text_templates()
+            files = list_text_templates(owner_for_ctx)
             empty_text = "Папка с пастами пуста"
             title = "📄 Выбери пасту для отправки:"
             prefix = "paste_send"
         elif data.startswith("reply_voice_menu:"):
-            files = list_voice_templates()
+            files = list_voice_templates(owner_for_ctx)
             empty_text = "Папка с голосовыми пуста"
             title = "🎙 Выбери голосовое сообщение:"
             prefix = "voice_send"
         else:
-            files = list_video_templates()
+            files = list_video_templates(owner_for_ctx)
             empty_text = "Папка с кружками пуста"
             title = "📹 Выбери кружок для отправки:"
             prefix = "video_send"
@@ -1314,10 +1511,11 @@ async def on_cb(ev):
     
     if data.startswith("paste_menu:"):
         ctx = data.split(":", 1)[1]
-        if ctx not in reply_contexts:
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
-        files = list_text_templates()
+        files = list_text_templates(admin_id)
         if not files:
             await ev.answer("Папка с пастами пуста", alert=True)
             return
@@ -1341,7 +1539,7 @@ async def on_cb(ev):
             _, ctx, mode, idx_str = parts
             if mode not in {"normal", "reply"}:
                 mode = "normal"
-        ctx_info = reply_contexts.get(ctx)
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
@@ -1350,7 +1548,7 @@ async def on_cb(ev):
         except ValueError:
             await ev.answer("Некорректный выбор", alert=True)
             return
-        files = list_text_templates()
+        files = list_text_templates(admin_id)
         if idx < 0 or idx >= len(files):
             await ev.answer("Файл не найден", alert=True)
             return
@@ -1364,7 +1562,7 @@ async def on_cb(ev):
         if not content:
             await ev.answer("Файл пуст", alert=True)
             return
-        worker = WORKERS.get(ctx_info["phone"])
+        worker = get_worker(admin_id, ctx_info["phone"])
         if not worker:
             await ev.answer("Аккаунт недоступен", alert=True)
             return
@@ -1385,10 +1583,11 @@ async def on_cb(ev):
 
     if data.startswith("voice_menu:"):
         ctx = data.split(":", 1)[1]
-        if ctx not in reply_contexts:
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
-        files = list_voice_templates()
+        files = list_voice_templates(admin_id)
         if not files:
             await ev.answer("Папка с голосовыми пуста", alert=True)
             return
@@ -1397,23 +1596,6 @@ async def on_cb(ev):
             admin_id,
             "🎙 Выбери голосовое сообщение:",
             buttons=build_asset_keyboard(files, "voice_send", ctx),
-        )
-        return
-    
-    if data.startswith("video_menu:"):
-        ctx = data.split(":", 1)[1]
-        if ctx not in reply_contexts:
-            await ev.answer("Контекст истёк", alert=True)
-            return
-        files = list_video_templates()
-        if not files:
-            await ev.answer("Папка с кружками пуста", alert=True)
-            return
-        await ev.answer()
-        await bot_client.send_message(
-            admin_id,
-            "📹 Выбери кружок для отправки:",
-            buttons=build_asset_keyboard(files, "video_send", ctx),
         )
         return
 
@@ -1429,7 +1611,7 @@ async def on_cb(ev):
             _, ctx, mode, idx_str = parts
             if mode not in {"normal", "reply"}:
                 mode = "normal"
-        ctx_info = reply_contexts.get(ctx)
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
@@ -1438,12 +1620,12 @@ async def on_cb(ev):
         except ValueError:
             await ev.answer("Некорректный выбор", alert=True)
             return
-        files = list_voice_templates()
+        files = list_voice_templates(admin_id)
         if idx < 0 or idx >= len(files):
             await ev.answer("Файл не найден", alert=True)
             return
         file_path = files[idx]
-        worker = WORKERS.get(ctx_info["phone"])
+        worker = get_worker(admin_id, ctx_info["phone"])
         if not worker:
             await ev.answer("Аккаунт недоступен", alert=True)
             return
@@ -1461,7 +1643,25 @@ async def on_cb(ev):
         await ev.answer("✅ Голосовое отправлено")
         await bot_client.send_message(admin_id, "✅ Голосовое сообщение отправлено собеседнику.")
         return
-    
+
+    if data.startswith("video_menu:"):
+        ctx = data.split(":", 1)[1]
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        files = list_video_templates(admin_id)
+        if not files:
+            await ev.answer("Папка с кружками пуста", alert=True)
+            return
+        await ev.answer()
+        await bot_client.send_message(
+            admin_id,
+            "📹 Выбери кружок для отправки:",
+            buttons=build_asset_keyboard(files, "video_send", ctx),
+        )
+        return
+
     if data.startswith("video_send:"):
         parts = data.split(":")
         if len(parts) not in (3, 4):
@@ -1474,7 +1674,7 @@ async def on_cb(ev):
             _, ctx, mode, idx_str = parts
             if mode not in {"normal", "reply"}:
                 mode = "normal"
-        ctx_info = reply_contexts.get(ctx)
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
@@ -1483,12 +1683,12 @@ async def on_cb(ev):
         except ValueError:
             await ev.answer("Некорректный выбор", alert=True)
             return
-        files = list_video_templates()
+        files = list_video_templates(admin_id)
         if idx < 0 or idx >= len(files):
             await ev.answer("Файл не найден", alert=True)
             return
         file_path = files[idx]
-        worker = WORKERS.get(ctx_info["phone"])
+        worker = get_worker(admin_id, ctx_info["phone"])
         if not worker:
             await ev.answer("Аккаунт недоступен", alert=True)
             return
@@ -1506,7 +1706,6 @@ async def on_cb(ev):
         await ev.answer("✅ Кружок отправлен")
         await bot_client.send_message(admin_id, "✅ Кружок отправлен собеседнику.")
         return
-
     if data == "asset_close":
         await ev.answer()
         return
@@ -1529,8 +1728,47 @@ async def on_text(ev):
 
     if text.startswith("/"):
         await cancel_operations(admin_id)
-        if text == "/start":
+        parts = text.split()
+        cmd = parts[0].lower()
+        if cmd == "/start":
             await ev.respond("Менеджер запущен. Выбери действие:", buttons=main_menu())
+        elif cmd == "/grant":
+            if not is_root_admin(admin_id):
+                await ev.respond("Команда доступна только супер-администратору.")
+                return
+            if len(parts) < 2:
+                await ev.respond("Использование: /grant <user_id> [root]")
+                return
+            try:
+                new_id = int(parts[1])
+            except ValueError:
+                await ev.respond("ID должен быть числом.")
+                return
+            role = "root" if len(parts) >= 3 and parts[2].lower() == "root" else "user"
+            ensure_tenant(new_id, role=role)
+            await ev.respond(f"Доступ выдан пользователю {new_id}. Роль: {role}.")
+            await safe_send_admin("Вам выдан доступ к менеджеру. Отправьте /start", owner_id=new_id)
+        elif cmd == "/revoke":
+            if not is_root_admin(admin_id):
+                await ev.respond("Команда доступна только супер-администратору.")
+                return
+            if len(parts) < 2:
+                await ev.respond("Использование: /revoke <user_id>")
+                return
+            try:
+                target_id = int(parts[1])
+            except ValueError:
+                await ev.respond("ID должен быть числом.")
+                return
+            if target_id in ROOT_ADMIN_IDS:
+                await ev.respond("Нельзя удалить первоначального супер-администратора.")
+                return
+            await clear_owner_runtime(target_id)
+            if remove_tenant(target_id):
+                await ev.respond(f"Доступ пользователя {target_id} отключен.")
+                await safe_send_admin("Ваш доступ к менеджеру отключен.", owner_id=target_id)
+            else:
+                await ev.respond("Пользователь не найден или уже удалён.")          
         else:
             await ev.respond("Неизвестная команда. Используй меню.")
         return
@@ -1542,11 +1780,11 @@ async def on_text(ev):
             return
         reply_waiting.pop(admin_id, None)
         ctx_id = waiting.get("ctx")
-        ctx = reply_contexts.get(ctx_id)
+        ctx = get_reply_context_for_admin(ctx_id, admin_id)
         if not ctx:
             await ev.reply("Контекст ответа устарел.")
             return
-        worker = WORKERS.get(ctx["phone"])
+        worker = get_worker(admin_id, ctx["phone"])
         if not worker:
             await ev.reply("Аккаунт недоступен.")
             return
@@ -1594,7 +1832,7 @@ async def on_text(ev):
                     if not text:
                         await ev.reply("Текст пасты не может быть пустым.")
                         return
-                    file_path = os.path.join(PASTES_DIR, f"{name}.txt")
+                    file_path = os.path.join(user_library_dir(admin_id, "pastes"), f"{name}.txt")
                     try:
                         with open(file_path, "w", encoding="utf-8") as f:
                             f.write(text)
@@ -1613,7 +1851,7 @@ async def on_text(ev):
                     ext = ".ogg"
                     if msg.file and msg.file.ext:
                         ext = msg.file.ext
-                    file_path = os.path.join(VOICES_DIR, f"{name}{ext}")
+                    file_path = os.path.join(user_library_dir(admin_id, "voices"), f"{name}{ext}")
                     try:
                         await msg.download_media(file=file_path)
                     except Exception as e:
@@ -1630,7 +1868,7 @@ async def on_text(ev):
                     ext = ".mp4"
                     if msg.file and msg.file.ext:
                         ext = msg.file.ext
-                    file_path = os.path.join(VIDEO_DIR, f"{name}{ext}")
+                      file_path = os.path.join(user_library_dir(admin_id, "video"), f"{name}{ext}")
                     try:
                         await msg.download_media(file=file_path)
                     except Exception as e:
@@ -1651,34 +1889,35 @@ async def on_text(ev):
             if not API_KEYS:
                 await ev.reply("Добавь API_KEYS в конфиг."); pending.pop(admin_id,None); return
 
-            api = API_KEYS[next_index("api_idx", len(API_KEYS))]
-            dev = DEVICE_PROFILES[next_index("dev_idx", len(DEVICE_PROFILES))] if DEVICE_PROFILES else {}
+            api = API_KEYS[next_index(admin_id, "api_idx", len(API_KEYS))]
+            dev = DEVICE_PROFILES[next_index(admin_id, "dev_idx", len(DEVICE_PROFILES))] if DEVICE_PROFILES else {}
 
             # восстановить сессию, если уже есть
             sess = None
-            meta = accounts_meta.get(phone)
-            if meta and os.path.exists(meta.get("session_file","")):
-                sess = open(meta["session_file"], "r", encoding="utf-8").read().strip() or None
+            meta = get_account_meta(admin_id, phone)
+            if meta and os.path.exists(meta.get("session_file", "")):
+                with open(meta["session_file"], "r", encoding="utf-8") as fh:
+                    sess = fh.read().strip() or None
 
-            w = AccountWorker(phone, api["api_id"], api["api_hash"], dev, sess)
+            w = AccountWorker(admin_id, phone, api["api_id"], api["api_hash"], dev, sess)
             try:
                 await w.send_code()
             except Exception as e:
                 await ev.reply(f"Не удалось отправить код: {e}")
                 pending.pop(admin_id,None); return
 
-            meta = accounts_meta.setdefault(phone, {"phone": phone})
+            meta = ensure_account_meta(admin_id, phone)
             meta.update(
                 {
                     "phone": phone,
                     "api_id": api["api_id"],
                     "device": dev.get("device_model", ""),
-                    "session_file": os.path.join(SESSIONS_DIR, f"{phone}.session"),
+                    "session_file": user_session_path(admin_id, phone),
                 }
             )
             meta["proxy_dynamic"] = w.using_dynamic_proxy
             meta["proxy_desc"] = w.proxy_description
-            _save(accounts_meta, ACCOUNTS_META)
+            persist_tenants()
 
             pending[admin_id] = {"step":"code","phone":phone,"worker":w}
             await ev.reply(f"Код отправлен на {phone}. Пришли код.")
@@ -1696,7 +1935,7 @@ async def on_text(ev):
                 await ev.reply(f"Ошибка входа: {e}")
                 pending.pop(admin_id, None)
                 return
-            WORKERS[phone] = w
+            register_worker(admin_id, phone, w)
             try:
                 await w.start()
             except AuthKeyDuplicatedError:
@@ -1718,7 +1957,7 @@ async def on_text(ev):
                 await w.sign_in_2fa(pwd)
             except Exception as e:
                 await ev.reply(f"2FA ошибка: {e}"); pending.pop(admin_id,None); return
-            WORKERS[phone]=w
+            register_worker(admin_id, phone, w)
             try:
                 await w.start()
             except AuthKeyDuplicatedError:
@@ -1736,27 +1975,42 @@ async def on_text(ev):
 async def startup():
     await bot_client.start(bot_token=BOT_TOKEN)
     log.info("Bot started. Restore workers...")
-    for phone, meta in accounts_meta.items():
-        sess = None
-        sf = meta.get("session_file")
-        if sf and os.path.exists(sf):
-            sess = open(sf, "r", encoding="utf-8").read().strip() or None
-        api_id = int(meta.get("api_id"))
-        api_hash = None
-        for k in API_KEYS:
-            if k["api_id"] == api_id:
-                api_hash = k["api_hash"]; break
-        if not api_hash and API_KEYS:
-            api_hash = API_KEYS[0]["api_hash"]
-        dev = next((d for d in DEVICE_PROFILES if d.get("device_model")==meta.get("device")), None) or (DEVICE_PROFILES[0] if DEVICE_PROFILES else {})
-        w = AccountWorker(phone, api_id, api_hash, dev, sess)
-        WORKERS[phone] = w
+    for owner_key, tenant_data in tenants.items():
         try:
-            await w.start()
-        except AuthKeyDuplicatedError:
-            log.warning("Worker %s session invalid; waiting for re-login.", phone)
-        except Exception as e:
-            log.warning("Worker %s not started yet: %s", phone, e)
+            owner_id = int(owner_key)
+        except (TypeError, ValueError):
+            continue
+        accounts = tenant_data.get("accounts", {}) if isinstance(tenant_data, dict) else {}
+        for phone, meta in accounts.items():
+            sess = None
+            session_path = meta.get("session_file") or user_session_path(owner_id, phone)
+            if session_path and os.path.exists(session_path):
+                try:
+                    with open(session_path, "r", encoding="utf-8") as fh:
+                        sess = fh.read().strip() or None
+                except OSError:
+                    sess = None
+            api_id = meta.get("api_id")
+            try:
+                api_id = int(api_id)
+            except (TypeError, ValueError):
+                api_id = API_KEYS[0]["api_id"] if API_KEYS else 0
+            api_hash = None
+            for k in API_KEYS:
+                if k["api_id"] == api_id:
+                    api_hash = k["api_hash"]
+                    break
+            if not api_hash and API_KEYS:
+                api_hash = API_KEYS[0]["api_hash"]
+            dev = next((d for d in DEVICE_PROFILES if d.get("device_model") == meta.get("device")), None) or (DEVICE_PROFILES[0] if DEVICE_PROFILES else {})
+            w = AccountWorker(owner_id, phone, api_id, api_hash, dev, sess)
+            register_worker(owner_id, phone, w)
+            try:
+                await w.start()
+            except AuthKeyDuplicatedError:
+                log.warning("Worker %s session invalid; waiting for re-login.", phone)
+            except Exception as e:
+                log.warning("Worker %s not started yet: %s", phone, e)
     await safe_send_admin("🚀 Бот запущен. /start", buttons=main_menu())
 
 def main():
@@ -1767,9 +2021,12 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        for w in WORKERS.values():
-            try: loop.run_until_complete(w.stop())
-            except: pass
+        for owner_workers in list(WORKERS.values()):
+            for w in owner_workers.values():
+                try:
+                    loop.run_until_complete(w.stop())
+                except Exception:
+                    pass
         try: loop.run_until_complete(bot_client.disconnect())
         except: pass
 
