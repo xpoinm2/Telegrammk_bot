@@ -137,6 +137,7 @@ VOICES_DIR = os.path.join(LIBRARY_DIR, "voices")
 VIDEO_DIR = os.path.join(LIBRARY_DIR, "video")
 TEXT_EXTENSIONS = {".txt", ".md"}
 VOICE_EXTENSIONS = {".ogg"}
+VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
 for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR):
     os.makedirs(_dir, exist_ok=True)
 ASSET_TITLE_MAX = 32
@@ -147,6 +148,7 @@ TYPING_CHAR_SPEED = (7.0, 14.0)  # символов в секунду
 TYPING_DURATION_LIMITS = (0.6, 4.0)  # минимальная и максимальная продолжительность «печати»
 TYPING_DURATION_VARIANCE = (0.85, 1.2)
 VOICE_RECORD_DURATION = (2.0, 4.0)  # секунд имитации записи голосового
+VIDEO_NOTE_RECORD_DURATION = (2.0, 4.0)  # секунд имитации записи кружка
 CHAT_ACTION_REFRESH = 4.5  # секунды между повторными действиями, если требуется
 # ============================================
 
@@ -212,6 +214,10 @@ def list_voice_templates() -> List[str]:
     return _list_files(VOICES_DIR, VOICE_EXTENSIONS)
 
 
+def list_video_templates() -> List[str]:
+    return _list_files(VIDEO_DIR, VIDEO_EXTENSIONS)
+
+
 def build_asset_keyboard(
     files: List[str],
     prefix: str,
@@ -233,6 +239,9 @@ def build_reply_options_keyboard(ctx: str, mode: str) -> List[List[Button]]:
         [
             Button.inline("📄 Пасты", f"reply_paste_menu:{ctx}:{mode}".encode()),
             Button.inline("🎙 Голосовые", f"reply_voice_menu:{ctx}:{mode}".encode()),
+        ],
+        [
+            Button.inline("📹 Кружки", f"reply_video_menu:{ctx}:{mode}".encode()),
         ],
         [Button.inline("❌ Отмена", f"reply_cancel:{ctx}".encode())],
     ]
@@ -435,20 +444,12 @@ class AccountWorker:
         if duration <= 0:
             return
         try:
-            await client.send_chat_action(peer, action)
+            async with client.action(peer, action):
+                await asyncio.sleep(duration)
         except Exception as e:
             log.debug("[%s] unable to send chat action %s: %s", self.phone, action, e)
             await asyncio.sleep(duration)
             return
-        remaining = duration
-        while remaining > 0:
-            sleep_for = min(remaining, CHAT_ACTION_REFRESH)
-            await asyncio.sleep(sleep_for)
-            remaining -= sleep_for
-            if remaining <= 0:
-                break
-            with contextlib.suppress(Exception):
-                await client.send_chat_action(peer, action)
 
     async def _simulate_typing(self, client: TelegramClient, peer: Any, message: str) -> None:
         duration = _typing_duration(message)
@@ -459,7 +460,14 @@ class AccountWorker:
             duration = random.uniform(*VOICE_RECORD_DURATION)
         else:
             duration = float(VOICE_RECORD_DURATION[0])
-        await self._simulate_chat_action(client, peer, "record-voice", duration)
+        await self._simulate_chat_action(client, peer, "record-audio", duration)
+
+    async def _simulate_round_recording(self, client: TelegramClient, peer: Any) -> None:
+        if VIDEO_NOTE_RECORD_DURATION[0] < VIDEO_NOTE_RECORD_DURATION[1]:
+            duration = random.uniform(*VIDEO_NOTE_RECORD_DURATION)
+        else:
+            duration = float(VIDEO_NOTE_RECORD_DURATION[0])
+        await self._simulate_chat_action(client, peer, "record-round", duration)
 
     async def _ensure_client(self) -> TelegramClient:
         if not self.client:
@@ -611,6 +619,7 @@ class AccountWorker:
                     [
                         Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
                         Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
+                        Button.inline("📹 Кружок", f"video_menu:{ctx_id}".encode()),
                     ],
                     [
                         Button.inline("📄 Пасты", f"paste_menu:{ctx_id}".encode()),
@@ -636,7 +645,7 @@ class AccountWorker:
                         link_preview=False,
                     )
 
-                if txt:
+                if txt and not forward_header:
                     await safe_send_admin(
                         f"💬 <b>Сообщение:</b>\n{html.escape(txt)}",
                         parse_mode="html",
@@ -821,6 +830,36 @@ class AccountWorker:
                 peer,
                 file_path,
                 voice_note=True,
+                reply_to=reply_to_msg_id,
+            )
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise RuntimeError("Аккаунт заблокирован Telegram")
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise RuntimeError("Аккаунт заморожен Telegram")
+        
+    async def send_video_note(
+        self,
+        chat_id: int,
+        file_path: str,
+        peer: Optional[Any] = None,
+        reply_to_msg_id: Optional[int] = None,
+    ):
+        client = await self._ensure_client()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Аккаунт не авторизован")
+        if peer is None:
+            try:
+                peer = await client.get_input_entity(chat_id)
+            except Exception:
+                peer = chat_id
+        await self._simulate_round_recording(client, peer)
+        try:
+            await client.send_file(
+                peer,
+                file_path,
+                video_note=True,
                 reply_to=reply_to_msg_id,
             )
         except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
@@ -1128,7 +1167,7 @@ async def on_cb(ev):
         await bot_client.send_message(admin_id, "❌ Ответ отменён.")
         return
 
-    if data.startswith("reply_paste_menu:") or data.startswith("reply_voice_menu:"):
+    if data.startswith(("reply_paste_menu:", "reply_voice_menu:", "reply_video_menu:")):
         parts = data.split(":", 2)
         if len(parts) != 3:
             await ev.answer("Некорректные данные", alert=True)
@@ -1137,20 +1176,25 @@ async def on_cb(ev):
         if ctx not in reply_contexts:
             await ev.answer("Контекст истёк", alert=True)
             return
-        files = (
-            list_text_templates()
-            if data.startswith("reply_paste_menu:")
-            else list_voice_templates()
-        )
+        if data.startswith("reply_paste_menu:"):
+            files = list_text_templates()
+            empty_text = "Папка с пастами пуста"
+            title = "📄 Выбери пасту для отправки:"
+            prefix = "paste_send"
+        elif data.startswith("reply_voice_menu:"):
+            files = list_voice_templates()
+            empty_text = "Папка с голосовыми пуста"
+            title = "🎙 Выбери голосовое сообщение:"
+            prefix = "voice_send"
+        else:
+            files = list_video_templates()
+            empty_text = "Папка с кружками пуста"
+            title = "📹 Выбери кружок для отправки:"
+            prefix = "video_send"
         if not files:
-            await ev.answer(
-                "Папка с пастами пуста" if data.startswith("reply_paste_menu:") else "Папка с голосовыми пуста",
-                alert=True,
-            )
+            await ev.answer(empty_text, alert=True)
             return
         await ev.answer()
-        title = "📄 Выбери пасту для отправки:" if data.startswith("reply_paste_menu:") else "🎙 Выбери голосовое сообщение:"
-        prefix = "paste_send" if data.startswith("reply_paste_menu:") else "voice_send"
         await bot_client.send_message(
             admin_id,
             title,
@@ -1245,6 +1289,23 @@ async def on_cb(ev):
             buttons=build_asset_keyboard(files, "voice_send", ctx),
         )
         return
+    
+    if data.startswith("video_menu:"):
+        ctx = data.split(":", 1)[1]
+        if ctx not in reply_contexts:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        files = list_video_templates()
+        if not files:
+            await ev.answer("Папка с кружками пуста", alert=True)
+            return
+        await ev.answer()
+        await bot_client.send_message(
+            admin_id,
+            "📹 Выбери кружок для отправки:",
+            buttons=build_asset_keyboard(files, "video_send", ctx),
+        )
+        return
 
     if data.startswith("voice_send:"):
         parts = data.split(":")
@@ -1289,6 +1350,51 @@ async def on_cb(ev):
             return
         await ev.answer("✅ Голосовое отправлено")
         await bot_client.send_message(admin_id, "✅ Голосовое сообщение отправлено собеседнику.")
+        return
+    
+    if data.startswith("video_send:"):
+        parts = data.split(":")
+        if len(parts) not in (3, 4):
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        if len(parts) == 3:
+            _, ctx, idx_str = parts
+            mode = "normal"
+        else:
+            _, ctx, mode, idx_str = parts
+            if mode not in {"normal", "reply"}:
+                mode = "normal"
+        ctx_info = reply_contexts.get(ctx)
+        if not ctx_info:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            await ev.answer("Некорректный выбор", alert=True)
+            return
+        files = list_video_templates()
+        if idx < 0 or idx >= len(files):
+            await ev.answer("Файл не найден", alert=True)
+            return
+        file_path = files[idx]
+        worker = WORKERS.get(ctx_info["phone"])
+        if not worker:
+            await ev.answer("Аккаунт недоступен", alert=True)
+            return
+        reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
+        try:
+            await worker.send_video_note(
+                ctx_info["chat_id"],
+                file_path,
+                ctx_info.get("peer"),
+                reply_to_msg_id=reply_to_msg_id,
+            )
+        except Exception as e:
+            await ev.answer(f"Ошибка отправки: {e}", alert=True)
+            return
+        await ev.answer("✅ Кружок отправлен")
+        await bot_client.send_message(admin_id, "✅ Кружок отправлен собеседнику.")
         return
 
     if data == "asset_close":
