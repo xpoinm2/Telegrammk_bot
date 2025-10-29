@@ -606,6 +606,13 @@ class AccountWorker:
                 ]
                 if forward_anchor:
                     info_lines.extend(["", f"Forwarded from {forward_anchor}"])
+                if txt:
+                    escaped_txt = html.escape(txt)
+                    info_lines.extend([
+                        "",
+                        "💬 <b>Сообщение:</b>",
+                        escaped_txt,
+                    ])
                 info_caption = "\n".join(info_lines)
 
                 reply_contexts[ctx_id] = {
@@ -641,13 +648,6 @@ class AccountWorker:
                     await safe_send_admin(
                         info_caption,
                         buttons=buttons,
-                        parse_mode="html",
-                        link_preview=False,
-                    )
-
-                if txt and not forward_header:
-                    await safe_send_admin(
-                        f"💬 <b>Сообщение:</b>\n{html.escape(txt)}",
                         parse_mode="html",
                         link_preview=False,
                     )
