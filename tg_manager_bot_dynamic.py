@@ -10,6 +10,7 @@ import secrets
 import html
 import re
 import shutil
+from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple, Set
 from io import BytesIO
@@ -436,6 +437,33 @@ def _list_files(directory: str, allowed_ext: Set[str]) -> List[str]:
     return files
 
 
+PAYLOAD_CACHE_LIMIT = 512
+_payload_cache: "OrderedDict[str, str]" = OrderedDict()
+
+
+def _register_payload(value: str) -> str:
+    """Register *value* in the inline payload cache and return its token."""
+
+    for _ in range(8):
+        token = secrets.token_urlsafe(8)
+        if token not in _payload_cache:
+            break
+    else:  # pragma: no cover - extremely unlikely
+        token = secrets.token_urlsafe(12)
+    _payload_cache[token] = value
+    _payload_cache.move_to_end(token)
+    while len(_payload_cache) > PAYLOAD_CACHE_LIMIT:
+        _payload_cache.popitem(last=False)
+    return token
+
+
+def _resolve_payload(token: str) -> Optional[str]:
+    value = _payload_cache.get(token)
+    if value is not None:
+        _payload_cache.move_to_end(token)
+    return value
+
+
 def _encode_payload(text: str) -> str:
     raw = base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
     return raw.rstrip("=")
@@ -518,7 +546,8 @@ def build_file_delete_keyboard(
     rows: List[List[Button]] = []
     for path in page_items:
         display = os.path.basename(path)
-        payload = f"file_del_do:{file_type}:{current_page}:{_encode_payload(path)}"
+        token = _register_payload(path)
+        payload = f"file_del_do:{file_type}:{current_page}:{token}"
         rows.append([Button.inline(f"🗑 {display}", payload.encode())])
     if total_count > ITEMS_PER_PAGE:
         nav: List[Button] = []
@@ -1815,11 +1844,13 @@ async def on_cb(ev):
         if not base_dir:
             await ev.answer("Неизвестный тип", alert=True)
             return
-        try:
-            path = _decode_payload(encoded)
-        except Exception:
-            await ev.answer("Некорректные данные", alert=True)
-            return
+        path = _resolve_payload(encoded)
+        if path is None:
+            try:
+                path = _decode_payload(encoded)
+            except Exception:
+                await ev.answer("Некорректные данные", alert=True)
+                return
         abs_base = os.path.abspath(base_dir)
         abs_path = os.path.abspath(path)
         if os.path.commonpath([abs_base, abs_path]) != abs_base:
