@@ -1868,7 +1868,7 @@ async def on_text(ev):
                     ext = ".mp4"
                     if msg.file and msg.file.ext:
                         ext = msg.file.ext
-                      file_path = os.path.join(user_library_dir(admin_id, "video"), f"{name}{ext}")
+                    file_path = os.path.join(user_library_dir(admin_id, "video"), f"{name}{ext}")
                     try:
                         await msg.download_media(file=file_path)
                     except Exception as e:
