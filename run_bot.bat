@@ -2,19 +2,73 @@
 setlocal
 cd /d "%~dp0"
 
-set PY311="C:\Users\User\AppData\Local\Programs\Python\Python311\python.exe"
+REM --- Поиск установленного Python ---
+set "PYTHON_CMD="
+for %%P in (python.exe python3.exe) do (
+    where %%P >nul 2>&1
+    if not errorlevel 1 (
+        set "PYTHON_CMD=%%P"
+        goto :found_python
+    )
+)
 
-REM если есть venv — активируем
-if exist venv\Scripts\activate call venv\Scripts\activate
-
-REM проверим нужные пакеты и при необходимости установим
-%PY311% -m pip show telethon >nul 2>&1 || %PY311% -m pip install telethon
-%PY311% -m pip show PySocks  >nul 2>&1 || %PY311% -m pip install PySocks
-
-REM запуск
-%PY311% -X dev tg_manager_bot_dynamic.py
+where py.exe >nul 2>&1
+if not errorlevel 1 (
+    for /f "usebackq delims=" %%P in (`py -3 -c "import sys; print(sys.executable)"`) do (
+        set "PYTHON_CMD=%%P"
+    )
+    if defined PYTHON_CMD goto :found_python
+)
 
 echo.
-echo ===== ПРОГРАММА ЗАВЕРШЕНА =====
+echo [ERROR] Python 3.10+ не найден. Установите Python с https://www.python.org/ и повторите попытку.
+pause
+exit /b 1
+
+:found_python
+echo.
+echo Используется Python: %PYTHON_CMD%
+
+"%PYTHON_CMD%" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" || (
+    echo.
+    echo [ERROR] Требуется Python версии 3.10 или новее.
+    pause
+    exit /b 1
+)
+
+REM --- Создание и активация виртуального окружения ---
+if not exist venv (
+    echo.
+    echo Создаётся виртуальное окружение...
+    "%PYTHON_CMD%" -m venv venv || goto :fail
+)
+
+call venv\Scripts\activate
+
+REM --- Установка зависимостей ---
+echo.
+echo Обновление pip и установка зависимостей...
+python -m pip install --upgrade pip || goto :fail
+if exist requirements.txt (
+    python -m pip install -r requirements.txt || goto :fail
+) else (
+    python -m pip install telethon python-socks || goto :fail
+)
+
+REM --- Запуск бота ---
+echo.
+echo Запуск бота...
+python -X dev tg_manager_bot_dynamic.py
+set "EXIT_CODE=%ERRORLEVEL%"
+
+echo.
+echo ===== ПРОГРАММА ЗАВЕРШЕНА ===== (код %EXIT_CODE%)
 echo Смотри вывод выше или файл bot.log
 pause
+exit /b %EXIT_CODE%
+
+:fail
+echo.
+echo [ERROR] Не удалось подготовить окружение. Проверь подключение к интернету и повтори попытку.
+pause
+exit /b 1

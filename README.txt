@@ -3,10 +3,14 @@ TG Manager Bot (Telethon) — dynamic proxy + multi-API
 
 1) Установка
 -----------
+На Windows достаточно запустить `run_bot.bat` — скрипт сам найдёт Python,
+создаст виртуальное окружение и установит зависимости перед запуском.
+
+Для ручной установки:
 python -m venv venv
 # Windows: venv\Scripts\activate
 # Linux/macOS: source venv/bin/activate
-pip install telethon python-socks
+pip install -r requirements.txt
 
 2) Настройка
 ------------
