@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import contextlib
 import os
 import json
@@ -145,6 +146,7 @@ for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR):
 ARCHIVE_DIR = "Archive"
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
 ASSET_TITLE_MAX = 32
+ITEMS_PER_PAGE = 10
 ACCOUNTS_META = "accounts.json"
 ROTATION_STATE = ".rotation_state.json"
 TENANTS_DB = "tenants.json"
@@ -434,6 +436,34 @@ def _list_files(directory: str, allowed_ext: Set[str]) -> List[str]:
     return files
 
 
+def _encode_payload(text: str) -> str:
+    raw = base64.urlsafe_b64encode(text.encode("utf-8")).decode("ascii")
+    return raw.rstrip("=")
+
+
+def _decode_payload(data: str) -> str:
+    padding = "=" * (-len(data) % 4)
+    raw = base64.urlsafe_b64decode((data + padding).encode("ascii"))
+    return raw.decode("utf-8")
+
+
+def paginate_list(items: List[Any], page: int, per_page: int = ITEMS_PER_PAGE) -> Tuple[List[Any], int, int, int]:
+    total = len(items)
+    if total == 0:
+        return [], 0, 0, 0
+    total_pages = max(1, (total + per_page - 1) // per_page)
+    page = max(0, min(page, total_pages - 1))
+    start = page * per_page
+    end = start + per_page
+    return items[start:end], page, total_pages, total
+
+
+def format_page_caption(base: str, page: int, total_pages: int) -> str:
+    if total_pages > 1:
+        return f"{base} (страница {page + 1}/{total_pages}):"
+    return f"{base}:"
+
+
 def sanitize_filename(name: str, default: str = "file") -> str:
     """Convert arbitrary text to a safe filename."""
     cleaned = re.sub(r"[^\w\s.-]", "", name, flags=re.UNICODE).strip()
@@ -452,6 +482,54 @@ def list_voice_templates(owner_id: int) -> List[str]:
 
 def list_video_templates(owner_id: int) -> List[str]:
     return _list_files(user_library_dir(owner_id, "video"), VIDEO_EXTENSIONS)
+
+
+FILE_TYPE_LABELS = {
+    "paste": "Пасты",
+    "voice": "Голосовые",
+    "video": "Кружки",
+}
+
+
+def list_templates_by_type(owner_id: int, file_type: str) -> List[str]:
+    if file_type == "paste":
+        return list_text_templates(owner_id)
+    if file_type == "voice":
+        return list_voice_templates(owner_id)
+    if file_type == "video":
+        return list_video_templates(owner_id)
+    return []
+
+
+def user_library_subdir(owner_id: int, file_type: str) -> Optional[str]:
+    if file_type == "paste":
+        return user_library_dir(owner_id, "pastes")
+    if file_type == "voice":
+        return user_library_dir(owner_id, "voices")
+    if file_type == "video":
+        return user_library_dir(owner_id, "video")
+    return None
+
+
+def build_file_delete_keyboard(
+    files: List[str], file_type: str, page: int = 0
+) -> Tuple[List[List[Button]], int, int, int]:
+    page_items, current_page, total_pages, total_count = paginate_list(list(files), page)
+    rows: List[List[Button]] = []
+    for path in page_items:
+        display = os.path.basename(path)
+        payload = f"file_del_do:{file_type}:{current_page}:{_encode_payload(path)}"
+        rows.append([Button.inline(f"🗑 {display}", payload.encode())])
+    if total_count > ITEMS_PER_PAGE:
+        nav: List[Button] = []
+        if current_page > 0:
+            nav.append(Button.inline("◀️", f"file_del_page:{file_type}:{current_page - 1}".encode()))
+        nav.append(Button.inline(f"{current_page + 1}/{total_pages}", b"noop"))
+        if current_page < total_pages - 1:
+            nav.append(Button.inline("▶️", f"file_del_page:{file_type}:{current_page + 1}".encode()))
+        rows.append(nav)
+    rows.append([Button.inline("⬅️ Назад", b"files_delete")])
+    return rows, current_page, total_pages, total_count
 
 
 def build_asset_keyboard(
@@ -1414,12 +1492,29 @@ def main_menu():
     ]
 
 
-def files_menu() -> List[List[Button]]:
+def files_root_menu() -> List[List[Button]]:
+    return [
+        [Button.inline("➕ Добавить", b"files_add")],
+        [Button.inline("🗑 Удалить", b"files_delete")],
+        [Button.inline("⬅️ Назад", b"back")],
+    ]
+
+
+def files_add_menu() -> List[List[Button]]:
     return [
         [Button.inline("📄 Пасты", b"files_paste")],
         [Button.inline("🎙 Голосовые", b"files_voice")],
         [Button.inline("📹 Кружки", b"files_video")],
-        [Button.inline("⬅️ Назад", b"back")],
+        [Button.inline("⬅️ Назад", b"files_root")],
+    ]
+
+
+def files_delete_menu() -> List[List[Button]]:
+    return [
+        [Button.inline("📄 Пасты", b"files_delete_paste")],
+        [Button.inline("🎙 Голосовые", b"files_delete_voice")],
+        [Button.inline("📹 Кружки", b"files_delete_video")],
+        [Button.inline("⬅️ Назад", b"files_root")],
     ]
 
 def account_control_menu():
@@ -1429,12 +1524,22 @@ def account_control_menu():
         [Button.inline("⬅️ Назад", b"back")],
     ]
 
-def build_account_buttons(owner_id: int, prefix: str) -> List[List[Button]]:
+def build_account_buttons(owner_id: int, prefix: str, page: int = 0) -> Tuple[List[List[Button]], int, int, int]:
+    phones = sorted(get_accounts_meta(owner_id).keys())
+    page_items, current_page, total_pages, total_count = paginate_list(list(phones), page)
     rows: List[List[Button]] = []
-    for phone in list(get_accounts_meta(owner_id).keys()):
+    for phone in page_items:
         rows.append([Button.inline(phone, f"{prefix}:{phone}".encode())])
+    if total_count > ITEMS_PER_PAGE:
+        nav: List[Button] = []
+        if current_page > 0:
+            nav.append(Button.inline("◀️", f"acct_page:{prefix}:{current_page - 1}".encode()))
+        nav.append(Button.inline(f"{current_page + 1}/{total_pages}", b"noop"))
+        if current_page < total_pages - 1:
+            nav.append(Button.inline("▶️", f"acct_page:{prefix}:{current_page + 1}".encode()))
+        rows.append(nav)
     rows.append([Button.inline("⬅️ Назад", b"list")])
-    return rows
+    return rows, current_page, total_pages, total_count
 
 @bot_client.on(events.NewMessage(pattern="/start"))
 async def on_start(ev):
@@ -1454,6 +1559,10 @@ async def on_cb(ev):
     notify_cancel = not data.startswith(("reply", "ui_back"))
     await cancel_operations(admin_id, notify=notify_cancel)
     await ensure_menu_keyboard(admin_id)
+
+    if data == "noop":
+        await ev.answer()
+        return
 
     if data.startswith("ui_back:"):
         session_id = data.split(":", 1)[1]
@@ -1508,9 +1617,24 @@ async def on_cb(ev):
         await ev.answer()
         await bot_client.send_message(
             admin_id,
-            "Выбери тип файлов для сохранения:",
-            buttons=files_menu(),
+            "Выбери действие с файлами:",
+            buttons=files_root_menu(),
         )
+        return
+
+    if data == "files_root":
+        await ev.answer()
+        await ev.edit("Выбери действие с файлами:", buttons=files_root_menu())
+        return
+
+    if data == "files_add":
+        await ev.answer()
+        await ev.edit("Выбери тип файлов для сохранения:", buttons=files_add_menu())
+        return
+
+    if data == "files_delete":
+        await ev.answer()
+        await ev.edit("Выбери тип файлов для удаления:", buttons=files_delete_menu())
         return
 
     if data == "files_paste":
@@ -1529,6 +1653,27 @@ async def on_cb(ev):
         pending[admin_id] = {"flow": "file", "file_type": "video", "step": "name"}
         await ev.answer()
         await bot_client.send_message(admin_id, "Введите название кружка:")
+        return
+
+    if data.startswith("files_delete_"):
+        _, _, file_type = data.partition("files_delete_")
+        if file_type not in FILE_TYPE_LABELS:
+            await ev.answer("Неизвестный тип", alert=True)
+            return
+        files = list_templates_by_type(admin_id, file_type)
+        if not files:
+            await ev.answer("Файлов не найдено", alert=True)
+            await ev.edit(
+                f"{FILE_TYPE_LABELS[file_type]} отсутствуют.",
+                buttons=files_delete_menu(),
+            )
+            return
+        buttons, page, total_pages, _ = build_file_delete_keyboard(files, file_type)
+        caption = format_page_caption(
+            f"{FILE_TYPE_LABELS[file_type]} для удаления", page, total_pages
+        )
+        await ev.answer()
+        await ev.edit(caption, buttons=buttons)
         return
 
     if data == "add":
@@ -1579,22 +1724,130 @@ async def on_cb(ev):
         if not get_accounts_meta(admin_id):
             await ev.answer("Нет аккаунтов", alert=True); return
         await ev.answer()
-        await bot_client.send_message(
-            admin_id,
-            "Выбери аккаунт для удаления:",
-            buttons=build_account_buttons(admin_id, "del_do"),
-        )
+        buttons, page, total_pages, _ = build_account_buttons(admin_id, "del_do")
+        caption = format_page_caption("Выбери аккаунт для удаления", page, total_pages)
+        await bot_client.send_message(admin_id, caption, buttons=buttons)
         return
 
     if data == "val_select":
         if not get_accounts_meta(admin_id):
             await ev.answer("Нет аккаунтов", alert=True); return
         await ev.answer()
-        await bot_client.send_message(
-            admin_id,
-            "Выбери аккаунт для проверки:",
-            buttons=build_account_buttons(admin_id, "val_do"),
+        buttons, page, total_pages, _ = build_account_buttons(admin_id, "val_do")
+        caption = format_page_caption("Выбери аккаунт для проверки", page, total_pages)
+        await bot_client.send_message(admin_id, caption, buttons=buttons)
+        return
+
+    if data.startswith("acct_page:"):
+        try:
+            _, prefix, page_str = data.split(":", 2)
+        except ValueError:
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        try:
+            page = int(page_str)
+        except ValueError:
+            await ev.answer("Некорректная страница", alert=True)
+            return
+        buttons, current_page, total_pages, total_count = build_account_buttons(
+            admin_id, prefix, page
         )
+        if total_count == 0:
+            await ev.answer("Нет аккаунтов", alert=True)
+            await ev.edit("Аккаунтов нет.", buttons=None)
+            return
+        if prefix == "del_do":
+            caption = format_page_caption("Выбери аккаунт для удаления", current_page, total_pages)
+        elif prefix == "val_do":
+            caption = format_page_caption("Выбери аккаунт для проверки", current_page, total_pages)
+        else:
+            caption = format_page_caption("Выберите аккаунт", current_page, total_pages)
+        await ev.answer()
+        await ev.edit(caption, buttons=buttons)
+        return
+
+    if data.startswith("file_del_page:"):
+        try:
+            _, file_type, page_str = data.split(":", 2)
+        except ValueError:
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        if file_type not in FILE_TYPE_LABELS:
+            await ev.answer("Неизвестный тип", alert=True)
+            return
+        try:
+            page = int(page_str)
+        except ValueError:
+            await ev.answer("Некорректная страница", alert=True)
+            return
+        files = list_templates_by_type(admin_id, file_type)
+        if not files:
+            await ev.answer("Файлы отсутствуют", alert=True)
+            await ev.edit(
+                f"{FILE_TYPE_LABELS[file_type]} отсутствуют.",
+                buttons=files_delete_menu(),
+            )
+            return
+        buttons, current_page, total_pages, _ = build_file_delete_keyboard(
+            files, file_type, page
+        )
+        caption = format_page_caption(
+            f"{FILE_TYPE_LABELS[file_type]} для удаления", current_page, total_pages
+        )
+        await ev.answer()
+        await ev.edit(caption, buttons=buttons)
+        return
+
+    if data.startswith("file_del_do:"):
+        try:
+            _, file_type, page_str, encoded = data.split(":", 3)
+        except ValueError:
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        if file_type not in FILE_TYPE_LABELS:
+            await ev.answer("Неизвестный тип", alert=True)
+            return
+        try:
+            page = int(page_str)
+        except ValueError:
+            page = 0
+        base_dir = user_library_subdir(admin_id, file_type)
+        if not base_dir:
+            await ev.answer("Неизвестный тип", alert=True)
+            return
+        try:
+            path = _decode_payload(encoded)
+        except Exception:
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        abs_base = os.path.abspath(base_dir)
+        abs_path = os.path.abspath(path)
+        if os.path.commonpath([abs_base, abs_path]) != abs_base:
+            await ev.answer("Удаление запрещено", alert=True)
+            return
+        try:
+            os.remove(abs_path)
+        except FileNotFoundError:
+            pass
+        except OSError as e:
+            await ev.answer(f"Не удалось удалить файл: {e}", alert=True)
+            return
+        files = list_templates_by_type(admin_id, file_type)
+        if not files:
+            await ev.edit(
+                f"{FILE_TYPE_LABELS[file_type]} отсутствуют.",
+                buttons=files_delete_menu(),
+            )
+            await ev.answer("Файл удалён")
+            return
+        buttons, current_page, total_pages, _ = build_file_delete_keyboard(
+            files, file_type, page
+        )
+        caption = format_page_caption(
+            f"{FILE_TYPE_LABELS[file_type]} для удаления", current_page, total_pages
+        )
+        await ev.edit(caption, buttons=buttons)
+        await ev.answer("Файл удалён")
         return
 
     if data.startswith("del_do:"):
