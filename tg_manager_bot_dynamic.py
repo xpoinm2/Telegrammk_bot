@@ -140,6 +140,12 @@ for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR):
 ASSET_TITLE_MAX = 32
 ACCOUNTS_META = "accounts.json"
 ROTATION_STATE = ".rotation_state.json"
+# Параметры имитации активности перед отправкой
+TYPING_CHAR_SPEED = (7.0, 14.0)  # символов в секунду
+TYPING_DURATION_LIMITS = (0.6, 4.0)  # минимальная и максимальная продолжительность «печати»
+TYPING_DURATION_VARIANCE = (0.85, 1.2)
+VOICE_RECORD_DURATION = (2.0, 4.0)  # секунд имитации записи голосового
+CHAT_ACTION_REFRESH = 4.5  # секунды между повторными действиями, если требуется
 # ============================================
 
 def _rand_delay(span: Tuple[int, int]) -> float:
@@ -147,6 +153,19 @@ def _rand_delay(span: Tuple[int, int]) -> float:
     if low >= high:
         return float(low)
     return random.uniform(low, high)
+
+def _typing_duration(message: str) -> float:
+    message = message or ""
+    variance = random.uniform(*TYPING_DURATION_VARIANCE)
+    if message:
+        speed = random.uniform(*TYPING_CHAR_SPEED)
+        estimated = len(message) / max(speed, 1e-3)
+        duration = estimated * variance
+    else:
+        low, high = TYPING_DURATION_LIMITS
+        duration = random.uniform(low, min(high, low + 0.5)) * variance
+    low, high = TYPING_DURATION_LIMITS
+    return max(low, min(duration, high))
 
 def _save(d, path):
     with open(path, "w", encoding="utf-8") as f:
@@ -395,6 +414,42 @@ class AccountWorker:
             app_version=self.device.get("app_version"),
             lang_code=self.device.get("lang_code"),
         )
+    
+    async def _simulate_chat_action(
+        self,
+        client: TelegramClient,
+        peer: Any,
+        action: str,
+        duration: float,
+    ) -> None:
+        if duration <= 0:
+            return
+        try:
+            await client.send_chat_action(peer, action)
+        except Exception as e:
+            log.debug("[%s] unable to send chat action %s: %s", self.phone, action, e)
+            await asyncio.sleep(duration)
+            return
+        remaining = duration
+        while remaining > 0:
+            sleep_for = min(remaining, CHAT_ACTION_REFRESH)
+            await asyncio.sleep(sleep_for)
+            remaining -= sleep_for
+            if remaining <= 0:
+                break
+            with contextlib.suppress(Exception):
+                await client.send_chat_action(peer, action)
+
+    async def _simulate_typing(self, client: TelegramClient, peer: Any, message: str) -> None:
+        duration = _typing_duration(message)
+        await self._simulate_chat_action(client, peer, "typing", duration)
+
+    async def _simulate_voice_recording(self, client: TelegramClient, peer: Any) -> None:
+        if VOICE_RECORD_DURATION[0] < VOICE_RECORD_DURATION[1]:
+            duration = random.uniform(*VOICE_RECORD_DURATION)
+        else:
+            duration = float(VOICE_RECORD_DURATION[0])
+        await self._simulate_chat_action(client, peer, "record-voice", duration)
 
     async def _ensure_client(self) -> TelegramClient:
         if not self.client:
@@ -725,6 +780,7 @@ class AccountWorker:
                 peer = await client.get_input_entity(chat_id)
             except Exception:
                 peer = chat_id
+        await self._simulate_typing(client, peer, message)
         try:
             await client.send_message(peer, message, reply_to=reply_to_msg_id)
         except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
@@ -749,6 +805,7 @@ class AccountWorker:
                 peer = await client.get_input_entity(chat_id)
             except Exception:
                 peer = chat_id
+        await self._simulate_voice_recording(client, peer)
         try:
             await client.send_file(
                 peer,
