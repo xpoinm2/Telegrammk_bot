@@ -340,18 +340,6 @@ def _typing_duration(message: str) -> float:
     low, high = TYPING_DURATION_LIMITS
     return max(low, min(duration, high))
 
-def _save(d, path):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(d, f, ensure_ascii=False, indent=2)
-
-def _load(path, default):
-    if os.path.exists(path):
-        try:
-            return json.load(open(path, "r", encoding="utf-8"))
-        except Exception:
-            return default
-    return default
-
 def _list_files(directory: str, allowed_ext: Set[str]) -> List[str]:
     if not os.path.isdir(directory):
         return []
