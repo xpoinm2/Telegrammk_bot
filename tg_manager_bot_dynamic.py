@@ -55,6 +55,14 @@ except ImportError:  # Telethon >= 1.34 moved/renamed the errors
 
 import socks  # PySocks
 
+# On Windows, prefer the selector-based event loop for compatibility with
+# libraries that expect the pre-3.8 default behaviour.
+if sys.platform.startswith("win"):
+    selector_policy_factory = getattr(asyncio, "WindowsSelectorEventLoopPolicy", None)
+    if selector_policy_factory is not None:
+        with contextlib.suppress(Exception):
+            asyncio.set_event_loop_policy(selector_policy_factory())
+
 # ================== LOGGING (console + file) ==================
 LOG_FILE = "bot.log"
 logger = logging.getLogger()
@@ -167,7 +175,8 @@ def _save(d, path):
 def _load(path, default):
     if os.path.exists(path):
         try:
-            return json.load(open(path, "r", encoding="utf-8"))
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
         except Exception:
             return default
     return default
