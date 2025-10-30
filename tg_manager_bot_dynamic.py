@@ -10,11 +10,12 @@ import secrets
 import html
 import re
 import shutil
+import socket
 from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple, Set
 from io import BytesIO
-from telethon import TelegramClient, events, Button, functions
+from telethon import TelegramClient, events, Button, functions, helpers
 from telethon.utils import get_display_name
 from telethon.sessions import StringSession
 from telethon.errors import (
@@ -54,6 +55,9 @@ except ImportError:  # Telethon >= 1.34 moved/renamed the errors
     )
 
 import socks  # PySocks
+
+from telethon.network.connection.connection import python_socks
+from telethon.network.connection.tcpfull import ConnectionTcpFull as _ConnectionTcpFull
 
 # On Windows, prefer the selector-based event loop for compatibility with
 # libraries that expect the pre-3.8 default behaviour.
@@ -650,6 +654,50 @@ async def safe_send_admin_file(file_data: bytes, filename: str, *, owner_id: Opt
             )
             continue
 
+# ---- connection helpers ----
+
+
+class _ThreadedPySocksConnection(_ConnectionTcpFull):
+    """Connection variant that avoids non-blocking PySocks issues on Windows."""
+
+    async def _proxy_connect(self, timeout=None, local_addr=None):  # type: ignore[override]
+        if python_socks:
+            return await super()._proxy_connect(timeout=timeout, local_addr=local_addr)
+
+        if isinstance(self._proxy, (tuple, list)):
+            parsed = self._parse_proxy(*self._proxy)
+        elif isinstance(self._proxy, dict):
+            parsed = self._parse_proxy(**self._proxy)
+        else:
+            raise TypeError(f"Proxy of unknown format: {type(self._proxy)}")
+
+        if ":" in parsed[1]:
+            mode, address = socket.AF_INET6, (self._ip, self._port, 0, 0)
+        else:
+            mode, address = socket.AF_INET, (self._ip, self._port)
+
+        sock = socks.socksocket(mode, socket.SOCK_STREAM)
+        sock.set_proxy(*parsed)
+        sock.settimeout(timeout)
+
+        if local_addr is not None:
+            sock.bind(local_addr)
+
+        loop = helpers.get_running_loop()
+        try:
+            await asyncio.wait_for(
+                loop.run_in_executor(None, sock.connect, address),
+                timeout=timeout,
+            )
+        except Exception:
+            with contextlib.suppress(Exception):
+                sock.close()
+            raise
+
+        sock.setblocking(False)
+        return sock
+
+
 # ---- dynamic proxy tuple ----
 def _proxy_tuple_from_config(config: Optional[Dict[str, Any]], *, context: str = "dynamic") -> Optional[Tuple]:
     if not config:
@@ -926,6 +974,7 @@ class AccountWorker:
         return TelegramClient(
             self.session, self.api_id, self.api_hash,
             proxy=proxy_cfg,
+            connection=_ThreadedPySocksConnection,
             device_model=self.device.get("device_model"),
             system_version=self.device.get("system_version"),
             app_version=self.device.get("app_version"),
