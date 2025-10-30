@@ -706,6 +706,8 @@ class AccountWorker:
         self._proxy_desc: str = proxy_desc(None)
         self._proxy_dynamic: bool = False
         self._proxy_override_signature: Optional[str] = None
+        self._proxy_forced_off: bool = False
+        self._proxy_force_reason: Optional[str] = None
 
     def _reset_session_state(self) -> None:
         with contextlib.suppress(FileNotFoundError):
@@ -812,7 +814,43 @@ class AccountWorker:
         if changed:
             persist_tenants()
 
+    def _disable_proxy_for_session(self, reason: str) -> None:
+        if self._proxy_forced_off:
+            return
+        self._proxy_forced_off = True
+        self._proxy_force_reason = reason
+        self._proxy_tuple = None
+        self._proxy_dynamic = False
+        self._proxy_desc = proxy_desc(None)
+        self._update_proxy_meta()
+        log.warning(
+            "[%s] proxy disabled for this session due to error: %s. Подключение продолжится без прокси.",
+            self.phone,
+            reason,
+        )
+
+    def _enable_proxy_for_session(self) -> None:
+        if not self._proxy_forced_off:
+            return
+        self._proxy_forced_off = False
+        self._proxy_force_reason = None
+
+    async def _disconnect_client(self) -> None:
+        if not self.client:
+            return
+        with contextlib.suppress(Exception):
+            await self.client.disconnect()
+        self.client = None
+
     def _select_proxy(self, *, force_new: bool = False) -> Optional[Tuple]:
+        if self._proxy_forced_off:
+            if self._proxy_tuple is not None or self._proxy_desc != proxy_desc(None) or self._proxy_dynamic:
+                self._proxy_tuple = None
+                self._proxy_dynamic = False
+                self._proxy_desc = proxy_desc(None)
+                self._update_proxy_meta()
+            return None
+
         meta = get_account_meta(self.owner_id, self.phone) or {}
         raw_override = meta.get("proxy_override")
         override_signature = "__none__"
@@ -933,7 +971,16 @@ class AccountWorker:
         if not self.client:
             self.client = self._make_client()
         if not self.client.is_connected():
-            await self.client.connect()
+            try:
+                await self.client.connect()
+            except ValueError as e:
+                if "non-blocking" in str(e).lower() and not self._proxy_forced_off:
+                    await self._disconnect_client()
+                    self._disable_proxy_for_session(str(e))
+                    self.client = self._make_client()
+                    await self.client.connect()
+                else:
+                    raise
         return self.client
 
     async def start(self):
@@ -1127,6 +1174,7 @@ class AccountWorker:
                 await self.client.disconnect()
         except Exception:
             pass
+        self._enable_proxy_for_session()
         self._select_proxy(force_new=True)
         self.client = self._make_client()
         await self.start()
