@@ -1,0 +1,35 @@
+{
+  "8099997426": {
+    "role": "root",
+    "accounts": {
+      "+13157537454": {
+        "phone": "+13157537454",
+        "proxy_desc": "SOCKS5://185.162.130.86:10000",
+        "proxy_dynamic": true,
+        "api_id": 24266525,
+        "device": "Huawei P30",
+        "session_file": "sessions\\8099997426\\+13157537454.session",
+        "full_name": "Paul Taylor"
+      }
+    },
+    "rotation_state": {
+      "api_idx": 1,
+      "dev_idx": 10
+    }
+  },
+  "7519364639": {
+    "role": "root",
+    "accounts": {},
+    "rotation_state": {}
+  },
+  "7951315317": {
+    "role": "user",
+    "accounts": {},
+    "rotation_state": {}
+  },
+  "7699405141": {
+    "role": "user",
+    "accounts": {},
+    "rotation_state": {}
+  }
+}
