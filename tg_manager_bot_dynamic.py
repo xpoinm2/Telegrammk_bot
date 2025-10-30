@@ -98,7 +98,7 @@ ROOT_ADMIN_IDS = {8099997426, 7519364639}
 # Если боту прокси не нужен — enabled=False
 DYNAMIC_PROXY = {
     "enabled": True,
-    "type": "HTTP",  # "HTTP" или "SOCKS5"
+    "type": "SOCKS5",  # "SOCKS5" или "HTTP"
     "host": "185.162.130.86",
     "port": 10000,
     "username": "cILkIEh3louyuDuw7tlK",
