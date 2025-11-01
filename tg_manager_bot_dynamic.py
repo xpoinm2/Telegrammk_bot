@@ -11,6 +11,7 @@ import html
 import re
 import shutil
 import socket
+from datetime import datetime
 from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple, Set
@@ -1518,6 +1519,13 @@ class AccountWorker:
         except UserDeactivatedError as e:
             await self._handle_account_disabled("frozen", e)
             raise RuntimeError("Аккаунт заморожен Telegram") from e
+        except (PeerIdInvalidError, ValueError, TypeError) as e:
+            log.warning(
+                "[%s] не удалось удалить диалог %s из-за некорректного peer: %s",
+                self.phone,
+                chat_id,
+                e,
+            )
         except Exception as e:
             raise RuntimeError(f"Не удалось удалить диалог: {e}") from e
         with contextlib.suppress(Exception):
