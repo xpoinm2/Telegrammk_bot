@@ -153,10 +153,11 @@ LIBRARY_DIR = "library"
 PASTES_DIR = os.path.join(LIBRARY_DIR, "pastes")
 VOICES_DIR = os.path.join(LIBRARY_DIR, "voices")
 VIDEO_DIR = os.path.join(LIBRARY_DIR, "video")
+PROXIES_DIR = os.path.join(LIBRARY_DIR, "proxies")
 TEXT_EXTENSIONS = {".txt", ".md"}
 VOICE_EXTENSIONS = {".ogg"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
-for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR):
+for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR, PROXIES_DIR):
     os.makedirs(_dir, exist_ok=True)
 ARCHIVE_DIR = "Archive"
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
@@ -205,6 +206,7 @@ def ensure_user_dirs(user_id: int) -> None:
     os.makedirs(base, exist_ok=True)
     for sub in ("pastes", "voices", "video"):
         os.makedirs(os.path.join(base, sub), exist_ok=True)
+    os.makedirs(os.path.join(PROXIES_DIR, str(user_id)), exist_ok=True)
     os.makedirs(os.path.join(SESSIONS_DIR, str(user_id)), exist_ok=True)
 
 
@@ -220,6 +222,26 @@ def user_sessions_dir(user_id: int) -> str:
 
 def user_session_path(user_id: int, phone: str) -> str:
     return os.path.join(user_sessions_dir(user_id), f"{phone}.session")
+
+
+def user_proxy_dir(user_id: int) -> str:
+    ensure_user_dirs(user_id)
+    return os.path.join(PROXIES_DIR, str(user_id))
+
+
+def store_user_proxy_config(user_id: int, config: Dict[str, Any]) -> str:
+    directory = user_proxy_dir(user_id)
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    host = str(config.get("host", "proxy"))
+    safe_host = re.sub(r"[^A-Za-z0-9_.-]", "_", host) or "proxy"
+    port = config.get("port", "")
+    filename = f"{timestamp}_{safe_host}_{port}.json" if port else f"{timestamp}_{safe_host}.json"
+    path = os.path.join(directory, filename)
+    to_dump = dict(config)
+    to_dump["saved_at"] = datetime.now().isoformat()
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(to_dump, fh, ensure_ascii=False, indent=2)
+    return path
 
 
 def ensure_tenant(user_id: int, *, role: str = "user") -> Dict[str, Any]:
@@ -651,50 +673,6 @@ def next_index(owner_id: int, key: str, length: int) -> int:
     persist_tenants()
     return cur
 
-# ---- bot client ----
-# Используем первую пару API_KEYS для бота
-bot_client = TelegramClient(
-    StringSession(),
-    API_KEYS[0]["api_id"],
-    API_KEYS[0]["api_hash"]
-)
-
-# безопасная отправка админу (не падаем, если админ ещё не нажал /start)
-def is_admin(user_id: int) -> bool:
-    return tenant_key(user_id) in tenants
-
-
-async def safe_send_admin(text: str, *, owner_id: Optional[int] = None, **kwargs):
-    targets = {owner_id} if owner_id is not None else all_admin_ids()
-    for admin_id in targets:
-        try:
-            await bot_client.send_message(admin_id, text, **kwargs)
-        except Exception as e:
-            logging.getLogger("mgrbot").warning(
-                "Cannot DM admin %s yet (probably admin hasn't started the bot): %s",
-                admin_id,
-                e,
-            )
-            continue
-
-
-async def safe_send_admin_file(file_data: bytes, filename: str, *, owner_id: Optional[int] = None, **kwargs) -> None:
-    if not file_data:
-        return
-    targets = {owner_id} if owner_id is not None else all_admin_ids()
-    for admin_id in targets:
-        try:
-            bio = BytesIO(file_data)
-            bio.name = filename
-            await bot_client.send_file(admin_id, bio, **kwargs)
-        except Exception as e:
-            logging.getLogger("mgrbot").warning(
-                "Cannot send file to admin %s yet (probably admin hasn't started the bot): %s",
-                admin_id,
-                e,
-            )
-            continue
-
 # ---- connection helpers ----
 
 
@@ -739,22 +717,32 @@ class _ThreadedPySocksConnection(_ConnectionTcpFull):
         return sock
 
 
-# ---- dynamic proxy tuple ----
+
 def _proxy_tuple_from_config(config: Optional[Dict[str, Any]], *, context: str = "dynamic") -> Optional[Tuple]:
     if not config:
         return None
-    if not bool(config.get("enabled", True)):
+    if not isinstance(config, dict):
+        log.warning("[%s] proxy config must be a mapping, got %s", context, type(config).__name__)
         return None
+    if not config.get("enabled", True):
+        return None
+    
     host = config.get("host")
     port = config.get("port")
     if not host or port is None:
-        log.warning("Proxy config %s is missing host/port: %s", context, config)
+        log.warning("[%s] proxy config missing host/port", context)
         return None
+    
     try:
         port_int = int(port)
     except (TypeError, ValueError):
-        log.warning("Proxy config %s has invalid port %r", context, port)
+        log.warning("[%s] proxy port must be integer, got %r", context, port)
         return None
+
+    username = config.get("username") or None
+    password = config.get("password") or None
+    rdns = bool(config.get("rdns", True))
+
     proxy_type = str(config.get("type", "HTTP")).upper()
     if proxy_type in {"SOCKS", "SOCKS5"}:
         proxy_const = socks.SOCKS5
@@ -762,21 +750,140 @@ def _proxy_tuple_from_config(config: Optional[Dict[str, Any]], *, context: str =
         proxy_const = socks.SOCKS4
     else:
         proxy_const = socks.HTTP
-    rdns = bool(config.get("rdns", True))
-    username = config.get("username")
-    password = config.get("password")
+
     return (proxy_const, host, port_int, rdns, username, password)
 
 
 def build_dynamic_proxy_tuple() -> Optional[Tuple]:
     return _proxy_tuple_from_config(DYNAMIC_PROXY, context="dynamic")
 
-def proxy_desc(p: Optional[Tuple]) -> str:
-    if not p: return "None"
-    tp, host, port, *_ = p
-    name = {socks.SOCKS5:"SOCKS5", socks.SOCKS4:"SOCKS4", socks.HTTP:"HTTP"}.get(tp, str(tp))
-    return f"{name}://{host}:{port}"
 
+def proxy_desc(p: Optional[Tuple]) -> str:
+    if not p:
+        return "None"
+    proxy_type, host, port, *_ = p
+    proto = {
+        socks.SOCKS5: "SOCKS5",
+        socks.SOCKS4: "SOCKS4",
+        socks.HTTP: "HTTP",
+    }.get(proxy_type, str(proxy_type))
+    return f"{proto}://{host}:{port}"
+
+
+def parse_proxy_input(text: str) -> Dict[str, Any]:
+    raw = text.strip()
+    if not raw:
+        raise ValueError("строка пуста")
+
+    scheme_split = raw.split("://", 1)
+    if len(scheme_split) == 2:
+        proxy_type, remainder = scheme_split[0].upper(), scheme_split[1]
+    else:
+        proxy_type, remainder = "SOCKS5", raw
+
+    username: Optional[str] = None
+    password: Optional[str] = None
+    host_part = remainder
+
+    if "@" in remainder:
+        creds, host_part = remainder.split("@", 1)
+        cred_parts = creds.split(":", 1)
+        if cred_parts:
+            username = cred_parts[0] or None
+        if len(cred_parts) == 2:
+            password = cred_parts[1] or None
+
+    host_sections = host_part.split(":")
+    if len(host_sections) < 2:
+        raise ValueError("ожидается формат host:port")
+
+    host = host_sections[0].strip()
+    if not host:
+        raise ValueError("адрес прокси не может быть пустым")
+
+    port_str = host_sections[1].strip()
+    if not port_str:
+        raise ValueError("порт обязателен")
+    try:
+        port = int(port_str)
+    except (TypeError, ValueError):
+        raise ValueError("порт должен быть числом")
+    if not (1 <= port <= 65535):
+        raise ValueError("порт вне диапазона 1-65535")
+
+    if len(host_sections) >= 3 and username is None:
+        username = host_sections[2] or None
+    if len(host_sections) >= 4 and password is None:
+        password = host_sections[3] or None
+
+    cfg: Dict[str, Any] = {
+        "enabled": True,
+        "type": proxy_type,
+        "host": host,
+        "port": port,
+        "rdns": True,
+    }
+    if username:
+        cfg["username"] = username
+    if password:
+        cfg["password"] = password
+    return cfg
+
+
+# ---- bot client ----
+BOT_PROXY_CONFIG = {
+    "enabled": True,
+    "type": "SOCKS5",
+    "host": "185.162.130.86",
+    "port": 10000,
+    "rdns": True,
+}
+BOT_PROXY_TUPLE = _proxy_tuple_from_config(BOT_PROXY_CONFIG, context="bot")
+
+# Используем первую пару API_KEYS для бота
+bot_client = TelegramClient(
+    StringSession(),
+    API_KEYS[0]["api_id"],
+    API_KEYS[0]["api_hash"],
+    proxy=BOT_PROXY_TUPLE,
+    connection=_ThreadedPySocksConnection,
+)
+
+# безопасная отправка админу (не падаем, если админ ещё не нажал /start)
+def is_admin(user_id: int) -> bool:
+    return tenant_key(user_id) in tenants
+
+
+async def safe_send_admin(text: str, *, owner_id: Optional[int] = None, **kwargs):
+    targets = {owner_id} if owner_id is not None else all_admin_ids()
+    for admin_id in targets:
+        try:
+            await bot_client.send_message(admin_id, text, **kwargs)
+        except Exception as e:
+            logging.getLogger("mgrbot").warning(
+                "Cannot DM admin %s yet (probably admin hasn't started the bot): %s",
+                admin_id,
+                e,
+            )
+            continue
+
+
+async def safe_send_admin_file(file_data: bytes, filename: str, *, owner_id: Optional[int] = None, **kwargs) -> None:
+    if not file_data:
+        return
+    targets = {owner_id} if owner_id is not None else all_admin_ids()
+    for admin_id in targets:
+        try:
+            bio = BytesIO(file_data)
+            bio.name = filename
+            await bot_client.send_file(admin_id, bio, **kwargs)
+        except Exception as e:
+            logging.getLogger("mgrbot").warning(
+                "Cannot send file to admin %s yet (probably admin hasn't started the bot): %s",
+                admin_id,
+                e,
+            )
+            continue
 
 def resolve_proxy_for_account(owner_id: int, phone: str, meta: Dict[str, Any]) -> Dict[str, Any]:
     raw_override = meta.get("proxy_override")
@@ -1896,6 +2003,14 @@ def account_control_menu():
         [Button.inline("⬅️ Назад", b"back")],
     ]
 
+
+def account_add_proxy_menu() -> List[List[Button]]:
+    return [
+        [Button.inline("🧷 Ввести прокси", b"account_proxy_manual")],
+        [Button.inline("🚫 Без прокси", b"account_proxy_none")],
+        [Button.inline("⬅️ Отмена", b"account_proxy_cancel")],
+    ]
+
 def build_account_buttons(owner_id: int, prefix: str, page: int = 0) -> Tuple[List[List[Button]], int, int, int]:
     phones = sorted(get_accounts_meta(owner_id).keys())
     page_items, current_page, total_pages, total_count = paginate_list(list(phones), page)
@@ -2108,8 +2223,54 @@ async def on_cb(ev):
         return
 
     if data == "add":
-        pending[admin_id] = {"step":"phone"}
-        await ev.answer(); await bot_client.send_message(admin_id, "Пришли номер телефона (+7XXXXXXXXXX)")
+        pending[admin_id] = {"flow": "account", "step": "proxy_choice"}
+        await ev.answer()
+        await bot_client.send_message(
+            admin_id,
+            (
+                "Перед добавлением аккаунта выбери подключение:"
+                "\n• введи адрес прокси, чтобы использовать его только для этого аккаунта"
+                "\n• или нажми \"Без прокси\" для прямого подключения"
+            ),
+            buttons=account_add_proxy_menu(),
+        )
+        return
+
+    if data == "account_proxy_manual":
+        st = pending.setdefault(admin_id, {"flow": "account"})
+        st["flow"] = "account"
+        st["step"] = "proxy_manual"
+        st.pop("proxy_config", None)
+        await ev.answer()
+        await bot_client.send_message(
+            admin_id,
+            (
+                "Пришли параметры прокси в формате\n"
+                "SOCKS5://host:port, host:port или host:port:логин:пароль.\n"
+                "Можно указать HTTP:// или SOCKS4://.\n"
+                "Напиши 'без прокси' для прямого подключения или 'отмена' для отмены."
+            ),
+        )
+        return
+
+    if data == "account_proxy_none":
+        st = pending.setdefault(admin_id, {"flow": "account"})
+        st["flow"] = "account"
+        st["step"] = "phone"
+        st["proxy_config"] = {"enabled": False}
+        await ev.answer()
+        await bot_client.send_message(
+            admin_id,
+            "Подключение будет без прокси. Пришли номер телефона (+7XXXXXXXXXX)",
+        )
+        return
+
+    if data == "account_proxy_cancel":
+        if pending.pop(admin_id, None) is not None:
+            await ev.answer("Добавление отменено", alert=True)
+        else:
+            await ev.answer()
+        await bot_client.send_message(admin_id, "Меню", buttons=main_menu())
         return
 
     if data == "list":
@@ -2869,93 +3030,174 @@ async def on_text(ev):
                 )
                 return
 
-        if st.get("step") == "phone":
-            phone = text
-            if not phone.startswith("+") or len(phone)<8:
-                await ev.reply("Неверный формат. Пример: +7XXXXXXXXXX"); return
-            if not API_KEYS:
-                await ev.reply("Добавь API_KEYS в конфиг."); pending.pop(admin_id,None); return
+        if flow == "account":
+            step = st.get("step")
+            lowered = text.lower()
+            cancel_words = {"отмена", "cancel", "стоп", "stop"}
+            no_proxy_words = {"без прокси", "без", "no proxy", "безпрокси"}
 
-            api = API_KEYS[next_index(admin_id, "api_idx", len(API_KEYS))]
-            dev = DEVICE_PROFILES[next_index(admin_id, "dev_idx", len(DEVICE_PROFILES))] if DEVICE_PROFILES else {}
+            if step in {"proxy_choice", "proxy_manual"}:
+                if lowered in cancel_words:
+                    pending.pop(admin_id, None)
+                    await ev.reply("Добавление аккаунта отменено.")
+                    return
+                if lowered in no_proxy_words:
+                    st["proxy_config"] = {"enabled": False}
+                    st["step"] = "phone"
+                    await ev.reply("Подключение будет без прокси. Пришли номер телефона (+7XXXXXXXXXX)")
+                    return
+                try:
+                    cfg = parse_proxy_input(text)
+                except ValueError as parse_error:
+                    await ev.reply(f"Некорректный формат прокси: {parse_error}.")
+                    return
+                cfg.setdefault("dynamic", False)
+                st["proxy_config"] = cfg
+                st["step"] = "phone"
+                try:
+                    store_user_proxy_config(admin_id, cfg)
+                except Exception as save_error:
+                    log.warning("[%s] cannot store proxy config: %s", admin_id, save_error)
+                await ev.reply("Прокси сохранён. Пришли номер телефона (+7XXXXXXXXXX)")
+                return
 
-            # восстановить сессию, если уже есть
-            sess = None
-            meta = get_account_meta(admin_id, phone)
-            if meta and os.path.exists(meta.get("session_file", "")):
-                with open(meta["session_file"], "r", encoding="utf-8") as fh:
-                    sess = fh.read().strip() or None
+            if step == "phone":
+                phone = text
+                if not phone.startswith("+") or len(phone) < 8:
+                    await ev.reply("Неверный формат. Пример: +7XXXXXXXXXX")
+                    return
+                if not API_KEYS:
+                    await ev.reply("Добавь API_KEYS в конфиг.")
+                    pending.pop(admin_id, None)
+                    return
 
-            w = AccountWorker(admin_id, phone, api["api_id"], api["api_hash"], dev, sess)
-            try:
-                await w.send_code()
-            except Exception as e:
-                await ev.reply(f"Не удалось отправить код: {e}")
-                pending.pop(admin_id,None); return
+                api = API_KEYS[next_index(admin_id, "api_idx", len(API_KEYS))]
+                dev = (
+                    DEVICE_PROFILES[next_index(admin_id, "dev_idx", len(DEVICE_PROFILES))]
+                    if DEVICE_PROFILES
+                    else {}
+                )
 
-            meta = ensure_account_meta(admin_id, phone)
-            meta.update(
-                {
+                sess = None
+                existing_meta = get_account_meta(admin_id, phone)
+                if existing_meta and os.path.exists(existing_meta.get("session_file", "")):
+                    with open(existing_meta["session_file"], "r", encoding="utf-8") as fh:
+                        sess = fh.read().strip() or None
+
+                proxy_cfg = st.get("proxy_config")
+
+                meta = ensure_account_meta(admin_id, phone)
+                meta.update(
+                    {
+                        "phone": phone,
+                        "api_id": api["api_id"],
+                        "device": dev.get("device_model", ""),
+                        "session_file": user_session_path(admin_id, phone),
+                    }
+                )
+                if proxy_cfg is not None:
+                    meta["proxy_override"] = dict(proxy_cfg)
+                else:
+                    meta.pop("proxy_override", None)
+                persist_tenants()
+
+                w = AccountWorker(admin_id, phone, api["api_id"], api["api_hash"], dev, sess)
+                extra_lines: List[str] = []
+                try:
+                    await w.send_code()
+                except Exception as send_err:
+                    if proxy_cfg and proxy_cfg.get("enabled", True):
+                        extra_lines.append(
+                            f"⚠️ Не удалось подключиться через указанный прокси: {send_err}."
+                            " Пробую напрямую."
+                        )
+                        meta.pop("proxy_override", None)
+                        persist_tenants()
+                        w = AccountWorker(admin_id, phone, api["api_id"], api["api_hash"], dev, sess)
+                        try:
+                            await w.send_code()
+                        except Exception as direct_err:
+                            pending.pop(admin_id, None)
+                            await ev.reply(f"Не удалось отправить код: {direct_err}")
+                            return
+                    else:
+                        pending.pop(admin_id, None)
+                        await ev.reply(f"Не удалось отправить код: {send_err}")
+                        return
+
+                meta["proxy_dynamic"] = w.using_dynamic_proxy
+                meta["proxy_desc"] = w.proxy_description
+                persist_tenants()
+
+                response_lines = extra_lines + [f"Код отправлен на {phone}. Пришли код."]
+                pending[admin_id] = {
+                    "flow": "account",
+                    "step": "code",
                     "phone": phone,
-                    "api_id": api["api_id"],
-                    "device": dev.get("device_model", ""),
-                    "session_file": user_session_path(admin_id, phone),
+                    "worker": w,
                 }
-            )
-            meta["proxy_dynamic"] = w.using_dynamic_proxy
-            meta["proxy_desc"] = w.proxy_description
-            persist_tenants()
+                await ev.reply("\n".join(response_lines))
+                return
 
-            pending[admin_id] = {"step":"code","phone":phone,"worker":w}
-            await ev.reply(f"Код отправлен на {phone}. Пришли код.")
-            return
-        if st["step"] == "code":
-            code = text
-            w: AccountWorker = st["worker"]; phone = st["phone"]
-            try:
-                await w.sign_in_code(code)
-            except SessionPasswordNeededError:
-                pending[admin_id]["step"] = "2fa"
-                await ev.reply("Включена двухэтапная защита. Пришли пароль 2FA для аккаунта.")
-                return
-            except Exception as e:
-                await ev.reply(f"Ошибка входа: {e}")
+            if step == "code":
+                code = text
+                w: AccountWorker = st["worker"]
+                phone = st.get("phone", "")
+                try:
+                    await w.sign_in_code(code)
+                except SessionPasswordNeededError:
+                    pending[admin_id] = {
+                        "flow": "account",
+                        "step": "2fa",
+                        "phone": phone,
+                        "worker": w,
+                    }
+                    await ev.reply("Включена двухэтапная защита. Пришли пароль 2FA для аккаунта.")
+                    return
+                except Exception as e:
+                    await ev.reply(f"Ошибка входа: {e}")
+                    pending.pop(admin_id, None)
+                    return
+                register_worker(admin_id, phone, w)
+                try:
+                    await w.start()
+                except AuthKeyDuplicatedError:
+                    pending.pop(admin_id, None)
+                    await ev.reply(
+                        "Сессия была аннулирована Telegram из-за одновременного входа с разных IP."
+                        " Попробуй ещё раз через несколько минут."
+                    )
+                    return
                 pending.pop(admin_id, None)
+                await ev.reply(f"✅ {phone} добавлен. Слушаю входящие.")
                 return
-            register_worker(admin_id, phone, w)
-            try:
-                await w.start()
-            except AuthKeyDuplicatedError:
+
+            if step == "2fa":
+                pwd = text
+                w: AccountWorker = st["worker"]
+                phone = st.get("phone", "")
+                try:
+                    await w.sign_in_2fa(pwd)
+                except Exception as e:
+                    await ev.reply(f"2FA ошибка: {e}")
+                    pending.pop(admin_id, None)
+                    return
+                register_worker(admin_id, phone, w)
+                try:
+                    await w.start()
+                except AuthKeyDuplicatedError:
+                    pending.pop(admin_id, None)
+                    await ev.reply(
+                        "Сессия была аннулирована Telegram из-за одновременного входа с разных IP."
+                        " Попробуй ещё раз через несколько минут."
+                    )
+                    return
                 pending.pop(admin_id, None)
-                await ev.reply(
-                    "Сессия была аннулирована Telegram из-за одновременного входа с разных IP."
-                    " Попробуй ещё раз через несколько минут."
-                )
+                await ev.reply(f"✅ {phone} добавлен (2FA). Слушаю входящие.")
                 return
+
+            await ev.reply("Неизвестный шаг добавления аккаунта. Операция отменена.")
             pending.pop(admin_id, None)
-            await ev.reply(f"✅ {phone} добавлен. Слушаю входящие.")
-            return
-
-
-        if st["step"] == "2fa":
-            pwd = text
-            w: AccountWorker = st["worker"]; phone = st["phone"]
-            try:
-                await w.sign_in_2fa(pwd)
-            except Exception as e:
-                await ev.reply(f"2FA ошибка: {e}"); pending.pop(admin_id,None); return
-            register_worker(admin_id, phone, w)
-            try:
-                await w.start()
-            except AuthKeyDuplicatedError:
-                pending.pop(admin_id, None)
-                await ev.reply(
-                    "Сессия была аннулирована Telegram из-за одновременного входа с разных IP."
-                    " Попробуй ещё раз через несколько минут."
-                )
-                return
-            pending.pop(admin_id,None)
-            await ev.reply(f"✅ {phone} добавлен (2FA). Слушаю входящие.")
             return
 
 # ---- startup ----
