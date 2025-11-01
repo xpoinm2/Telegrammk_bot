@@ -197,8 +197,31 @@ def persist_tenants() -> None:
     _save(tenants, TENANTS_DB)
 
 
-def tenant_key(user_id: int) -> str:
-    return str(int(user_id))
+def _normalize_peer_id(user_id: Any) -> int:
+    """Extract the integer ID from Telethon peer objects or raw identifiers."""
+
+    if isinstance(user_id, bool):  # guard against bool being a subclass of int
+        raise TypeError("Boolean is not a valid Telegram identifier")
+
+    if isinstance(user_id, int):
+        return user_id
+
+    if isinstance(user_id, str):
+        cleaned = user_id.strip()
+        if not cleaned:
+            raise ValueError("Empty string cannot represent a Telegram identifier")
+        return int(cleaned)
+
+    for attr in ("user_id", "channel_id", "chat_id"):
+        value = getattr(user_id, attr, None)
+        if value is not None:
+            return int(value)
+
+    raise TypeError(f"Unsupported Telegram identifier type: {type(user_id)!r}")
+
+
+def tenant_key(user_id: Any) -> str:
+    return str(_normalize_peer_id(user_id))
 
 
 def ensure_user_dirs(user_id: int) -> None:
@@ -448,8 +471,13 @@ def all_admin_ids() -> Set[int]:
     return ids
 
 
-def is_root_admin(user_id: int) -> bool:
-    data = tenants.get(tenant_key(user_id))
+def is_root_admin(user_id: Any) -> bool:
+    try:
+        key = tenant_key(user_id)
+    except (TypeError, ValueError) as exc:
+        log.warning("Cannot normalise ID %r for root admin check: %s", user_id, exc)
+        return False
+    data = tenants.get(key)
     if not data:
         return False
     return data.get("role") == "root"
@@ -869,8 +897,13 @@ bot_client = TelegramClient(
 )
 
 # безопасная отправка админу (не падаем, если админ ещё не нажал /start)
-def is_admin(user_id: int) -> bool:
-    return tenant_key(user_id) in tenants
+def is_admin(user_id: Any) -> bool:
+    try:
+        key = tenant_key(user_id)
+    except (TypeError, ValueError) as exc:
+        log.warning("Cannot normalise ID %r for admin check: %s", user_id, exc)
+        return False
+    return key in tenants
 
 
 async def safe_send_admin(text: str, *, owner_id: Optional[int] = None, **kwargs):
