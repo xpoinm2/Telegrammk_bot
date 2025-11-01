@@ -906,6 +906,27 @@ def is_admin(user_id: Any) -> bool:
     return key in tenants
 
 
+def _extract_event_user_id(ev: Any) -> Optional[int]:
+    """Best-effort extraction of the Telegram user id from an event."""
+
+    candidates = [getattr(ev, "sender_id", None), getattr(ev, "chat_id", None)]
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        try:
+            return _normalize_peer_id(candidate)
+        except (TypeError, ValueError):
+            continue
+
+    peer = getattr(ev, "peer_id", None)
+    if peer is not None:
+        try:
+            return _normalize_peer_id(peer)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 async def safe_send_admin(text: str, *, owner_id: Optional[int] = None, **kwargs):
     targets = {owner_id} if owner_id is not None else all_admin_ids()
     for admin_id in targets:
@@ -2082,18 +2103,19 @@ def build_account_buttons(owner_id: int, prefix: str, page: int = 0) -> Tuple[Li
 
 @bot_client.on(events.NewMessage(pattern="/start"))
 async def on_start(ev):
-    if not is_admin(ev.sender_id):
+    admin_id = _extract_event_user_id(ev)
+    if admin_id is None or not is_admin(admin_id):
         await ev.respond("Доступ запрещён."); return
-    await cancel_operations(ev.sender_id, notify=False)
+    await cancel_operations(admin_id, notify=False)
     await ev.respond("Менеджер запущен. Выбери действие:", buttons=main_menu())
-    await ensure_menu_keyboard(ev.sender_id)
+    await ensure_menu_keyboard(admin_id)
 
 @bot_client.on(events.CallbackQuery)
 async def on_cb(ev):
-    if not is_admin(ev.sender_id):
+    admin_id = _extract_event_user_id(ev)
+    if admin_id is None or not is_admin(admin_id):
         await ev.answer("Недоступно", alert=True); return
     data = ev.data.decode() if isinstance(ev.data, (bytes, bytearray)) else str(ev.data)
-    admin_id = ev.sender_id
 
     notify_cancel = not data.startswith(("reply", "ui_back"))
     await cancel_operations(admin_id, notify=notify_cancel)
@@ -2808,9 +2830,10 @@ async def on_cb(ev):
 
 @bot_client.on(events.NewMessage)
 async def on_text(ev):
-    if not is_admin(ev.sender_id): return
+    admin_id = _extract_event_user_id(ev)
+    if admin_id is None or not is_admin(admin_id):
+        return
     text = (ev.raw_text or "").strip()
-    admin_id = ev.sender_id
 
     await ensure_menu_keyboard(admin_id)
 
