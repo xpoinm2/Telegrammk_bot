@@ -15,12 +15,14 @@
     "rotation_state": {
       "api_idx": 1,
       "dev_idx": 10
-    }
+    },
+    "proxy": {}
   },
   "7519364639": {
     "role": "root",
     "accounts": {},
-    "rotation_state": {}
+    "rotation_state": {},
+    "proxy": {}
   },
   "7951315317": {
     "role": "user",
@@ -30,6 +32,34 @@
   "7699405141": {
     "role": "user",
     "accounts": {},
-    "rotation_state": {}
+    "rotation_state": {
+      "api_idx": 1,
+      "dev_idx": 1
+    },
+    "proxy": {}
+  },
+  "7847368137": {
+    "role": "user",
+    "accounts": {},
+    "rotation_state": {},
+    "proxy": {}
+  },
+  "7972504487": {
+    "role": "user",
+    "accounts": {},
+    "rotation_state": {},
+    "proxy": {}
+  },
+  "6710555152": {
+    "role": "user",
+    "accounts": {},
+    "rotation_state": {},
+    "proxy": {}
+  },
+  "1080551826": {
+    "role": "user",
+    "accounts": {},
+    "rotation_state": {},
+    "proxy": {}
   }
 }
