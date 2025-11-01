@@ -831,13 +831,32 @@ def parse_proxy_input(text: str) -> Dict[str, Any]:
 
 
 # ---- bot client ----
-BOT_PROXY_CONFIG = {
-    "enabled": True,
-    "type": "SOCKS5",
-    "host": "185.162.130.86",
-    "port": 10000,
-    "rdns": True,
-}
+
+
+def build_bot_proxy_config() -> Dict[str, Any]:
+    """Derive proxy settings for the service bot itself.
+
+    Historically the bot proxy configuration duplicated ``DYNAMIC_PROXY`` but
+    without the optional credentials.  When the upstream provider requires
+    authentication this resulted in ``GeneralProxyError`` during start-up,
+    because the proxy rejected the unauthenticated SOCKS5 handshake.  Reuse the
+    dynamic proxy values instead so the bot client benefits from the same
+    credentials (while still allowing manual overrides by editing the returned
+    mapping).
+    """
+
+    base: Dict[str, Any] = {}
+    if isinstance(DYNAMIC_PROXY, dict):
+        base.update(DYNAMIC_PROXY)
+
+    # If the dynamic proxy config was disabled entirely fall back to the
+    # default behaviour of running without a proxy (``enabled`` evaluates to
+    # False downstream and ``_proxy_tuple_from_config`` will return ``None``).
+    base.setdefault("enabled", True)
+    return base
+
+
+BOT_PROXY_CONFIG = build_bot_proxy_config()
 BOT_PROXY_TUPLE = _proxy_tuple_from_config(BOT_PROXY_CONFIG, context="bot")
 
 # Используем первую пару API_KEYS для бота
