@@ -21,6 +21,7 @@ from telethon.sessions import StringSession
 from telethon.errors import (
     SessionPasswordNeededError,
     FloodWaitError,
+    PeerIdInvalidError,
 )
 try:  # Telethon <= 1.33.1
     from telethon.errors import AuthKeyDuplicatedError  # type: ignore[attr-defined]
@@ -229,6 +230,7 @@ def ensure_tenant(user_id: int, *, role: str = "user") -> Dict[str, Any]:
         data["role"] = "root"
     data.setdefault("accounts", {})
     data.setdefault("rotation_state", {})
+    data.setdefault("proxy", {})
     ensure_user_dirs(user_id)
     persist_tenants()
     return data
@@ -242,6 +244,11 @@ def get_tenant(user_id: int) -> Dict[str, Any]:
     data = tenants[key]
     data.setdefault("accounts", {})
     data.setdefault("rotation_state", {})
+    if not isinstance(data.get("proxy"), dict):
+        data["proxy"] = {}
+        persist_tenants()
+    else:
+        data.setdefault("proxy", {})
     return data
 
 
@@ -268,6 +275,39 @@ def ensure_account_meta(owner_id: int, phone: str) -> Dict[str, Any]:
     accounts = get_accounts_meta(owner_id)
     meta = accounts.setdefault(phone, {"phone": phone})
     return meta
+
+
+def get_tenant_proxy_config(owner_id: int) -> Dict[str, Any]:
+    tenant = get_tenant(owner_id)
+    proxy_cfg = tenant.get("proxy")
+    if not isinstance(proxy_cfg, dict):
+        proxy_cfg = {}
+        tenant["proxy"] = proxy_cfg
+        persist_tenants()
+    return proxy_cfg
+
+
+def set_tenant_proxy_config(owner_id: int, config: Dict[str, Any]) -> None:
+    tenant = get_tenant(owner_id)
+    tenant["proxy"] = dict(config)
+    persist_tenants()
+
+
+def clear_tenant_proxy_config(owner_id: int) -> None:
+    tenant = get_tenant(owner_id)
+    tenant["proxy"] = {}
+    persist_tenants()
+
+
+def get_active_tenant_proxy(owner_id: int) -> Optional[Dict[str, Any]]:
+    cfg = get_tenant_proxy_config(owner_id)
+    if not cfg:
+        return None
+    if not bool(cfg.get("enabled", True)):
+        return None
+    if not cfg.get("host") or cfg.get("port") is None:
+        return None
+    return cfg
 
 
 async def clear_owner_runtime(owner_id: int) -> None:
@@ -736,6 +776,80 @@ def proxy_desc(p: Optional[Tuple]) -> str:
     name = {socks.SOCKS5:"SOCKS5", socks.SOCKS4:"SOCKS4", socks.HTTP:"HTTP"}.get(tp, str(tp))
     return f"{name}://{host}:{port}"
 
+
+def resolve_proxy_for_account(owner_id: int, phone: str, meta: Dict[str, Any]) -> Dict[str, Any]:
+    raw_override = meta.get("proxy_override")
+    override_signature = "__none__"
+    override_cfg: Optional[Dict[str, Any]] = None
+    override_enabled = True
+    warnings: List[Tuple[str, Optional[str]]] = []
+
+    if raw_override is None:
+        override_signature = "__none__"
+    elif isinstance(raw_override, dict):
+        try:
+            override_signature = json.dumps(raw_override, sort_keys=True, ensure_ascii=False, default=str)
+        except (TypeError, ValueError):
+            override_signature = str(raw_override)
+        override_cfg = raw_override
+        override_enabled = bool(override_cfg.get("enabled", True))
+    else:
+        override_signature = "__invalid_type__"
+        override_enabled = True
+        warnings.append(("invalid_type", type(raw_override).__name__))
+
+    proxy_tuple: Optional[Tuple] = None
+    is_dynamic = False
+
+    if override_cfg is not None:
+        if override_enabled:
+            proxy_tuple = _proxy_tuple_from_config(override_cfg, context=f"account:{phone}")
+            if proxy_tuple is None:
+                warnings.append(("override_invalid", None))
+            else:
+                is_dynamic = bool(override_cfg.get("dynamic"))
+        else:
+            proxy_tuple = None
+
+    if proxy_tuple is None and override_enabled:
+        tenant_cfg = get_active_tenant_proxy(owner_id)
+        if tenant_cfg:
+            tenant_tuple = _proxy_tuple_from_config(tenant_cfg, context=f"tenant:{owner_id}")
+            if tenant_tuple is not None:
+                proxy_tuple = tenant_tuple
+                is_dynamic = bool(tenant_cfg.get("dynamic"))
+            else:
+                warnings.append(("tenant_invalid", None))
+
+    if proxy_tuple is None and override_enabled:
+        dynamic_tuple = build_dynamic_proxy_tuple()
+        if dynamic_tuple is not None:
+            proxy_tuple = dynamic_tuple
+            is_dynamic = True
+
+    return {
+        "proxy_tuple": proxy_tuple,
+        "dynamic": is_dynamic,
+        "override_signature": override_signature,
+        "override_cfg": override_cfg,
+        "override_enabled": override_enabled,
+        "warnings": warnings,
+    }
+
+
+def recompute_account_proxy_meta(owner_id: int, phone: str, meta: Dict[str, Any]) -> Tuple[bool, Dict[str, Any]]:
+    resolution = resolve_proxy_for_account(owner_id, phone, meta)
+    desc = proxy_desc(resolution["proxy_tuple"])
+    dynamic = resolution["dynamic"]
+    changed = False
+    if meta.get("proxy_desc") != desc:
+        meta["proxy_desc"] = desc
+        changed = True
+    if meta.get("proxy_dynamic") != dynamic:
+        meta["proxy_dynamic"] = dynamic
+        changed = True
+    return changed, resolution
+
 # ---- worker ----
 class AccountWorker:
     def __init__(self, owner_id: int, phone: str, api_id: int, api_hash: str, device: Dict[str,str], session_str: Optional[str]):
@@ -900,53 +1014,45 @@ class AccountWorker:
             return None
 
         meta = get_account_meta(self.owner_id, self.phone) or {}
-        raw_override = meta.get("proxy_override")
-        override_signature = "__none__"
-        override_cfg: Optional[Dict[str, Any]] = None
-        if raw_override is None:
-            override_signature = "__none__"
-        elif isinstance(raw_override, dict):
-            try:
-                override_signature = json.dumps(raw_override, sort_keys=True, ensure_ascii=False, default=str)
-            except (TypeError, ValueError):
-                override_signature = str(raw_override)
-            override_cfg = raw_override
-        else:
-            override_signature = "__invalid_type__"
-            if self._proxy_override_signature != override_signature:
-                log.warning(
-                    "[%s] proxy_override must be a mapping, got %r. Игнорирую переопределение.",
-                    self.phone,
-                    type(raw_override).__name__,
-                )
+        resolution = resolve_proxy_for_account(self.owner_id, self.phone, meta)
+        override_signature = resolution["override_signature"]
 
         need_refresh = force_new or self._proxy_tuple is None or override_signature != self._proxy_override_signature
         if not need_refresh:
             return self._proxy_tuple
 
-        proxy_tuple: Optional[Tuple] = None
-        is_dynamic = False
-
-        if override_cfg is not None:
-            if not bool(override_cfg.get("enabled", True)):
-                proxy_tuple = None
-            else:
-                proxy_tuple = _proxy_tuple_from_config(override_cfg, context=f"account:{self.phone}")
-                if proxy_tuple is None and self._proxy_override_signature != override_signature:
+        if self._proxy_override_signature != override_signature:
+            for code, detail in resolution.get("warnings", []):
+                if code == "invalid_type":
                     log.warning(
-                        "[%s] proxy_override указано, но конфигурация некорректна. Пытаюсь использовать динамический прокси.",
+                        "[%s] proxy_override must be a mapping, got %s. Игнорирую переопределение.",
+                        self.phone,
+                        detail or "unknown",
+                    )
+                elif code == "override_invalid":
+                    log.warning(
+                        "[%s] proxy_override указано, но конфигурация некорректна. Пытаюсь использовать пользовательский или динамический прокси.",
+                        self.phone,
+                    )
+                elif code == "tenant_invalid":
+                    log.warning(
+                        "[%s] пользовательский прокси для пользователя настроен, но параметры некорректны. Подключение пойдёт без него или с глобальным прокси.",
                         self.phone,
                     )
 
-        if proxy_tuple is None and (override_cfg is None or bool(override_cfg.get("enabled", True))):
-            dynamic_tuple = build_dynamic_proxy_tuple()
-            if dynamic_tuple is not None:
-                proxy_tuple = dynamic_tuple
-                is_dynamic = True
+        proxy_tuple: Optional[Tuple] = resolution["proxy_tuple"]
+        is_dynamic = resolution["dynamic"]
+        override_cfg = resolution.get("override_cfg")
+        override_enabled = resolution.get("override_enabled", True)
 
-        if proxy_tuple is None and override_cfg is not None and bool(override_cfg.get("enabled", True)) and self._proxy_override_signature != override_signature:
+        if (
+            proxy_tuple is None
+            and override_cfg is not None
+            and override_enabled
+            and self._proxy_override_signature != override_signature
+        ):
             log.warning(
-                "[%s] proxy_override не удалось применить и динамический прокси отключён. Подключение пойдёт без прокси.",
+                "[%s] proxy_override не удалось применить. Подключение пойдёт без прокси или с системным по умолчанию.",
                 self.phone,
             )
 
@@ -968,6 +1074,29 @@ class AccountWorker:
         if self._proxy_tuple is None:
             self._select_proxy()
         return self._proxy_dynamic
+
+    async def refresh_proxy(self, restart: bool = True) -> None:
+        self._proxy_forced_off = False
+        self._proxy_force_reason = None
+        self._proxy_tuple = None
+        self._proxy_dynamic = False
+        self._proxy_desc = proxy_desc(None)
+        self._proxy_override_signature = None
+        self._select_proxy(force_new=True)
+        if restart and self.started:
+            was_started = self.started
+            await self.stop()
+            self.client = None
+            if was_started:
+                try:
+                    await self.start()
+                except Exception as exc:
+                    log.warning(
+                        "[%s] не удалось перезапустить аккаунт после обновления прокси: %s",
+                        self.phone,
+                        exc,
+                    )
+                    raise
 
     def _make_client(self) -> TelegramClient:
         proxy_cfg = self._select_proxy()
@@ -1437,6 +1566,52 @@ reply_contexts: Dict[str, Dict[str, Any]] = {}
 reply_waiting: Dict[int, Dict[str, Any]] = {}
 
 
+async def apply_proxy_config_to_owner(owner_id: int, *, restart_active: bool = True) -> Tuple[int, List[str]]:
+    owner_workers = WORKERS.get(owner_id, {})
+    restarted = 0
+    errors: List[str] = []
+
+    for phone, worker in owner_workers.items():
+        try:
+            await worker.refresh_proxy(restart=restart_active)
+            restarted += 1
+        except Exception as exc:
+            err_text = str(exc)
+            errors.append(f"{phone}: {err_text}")
+            log.warning("[%s] не удалось обновить прокси: %s", phone, exc)
+
+    accounts = get_accounts_meta(owner_id)
+    changed = False
+    for phone, meta in accounts.items():
+        if phone in owner_workers:
+            continue
+        meta_changed, resolution = recompute_account_proxy_meta(owner_id, phone, meta)
+        if meta_changed:
+            changed = True
+        for code, detail in resolution.get("warnings", []):
+            if code == "invalid_type":
+                log.warning(
+                    "[%s] proxy_override must be a mapping, got %s. Игнорирую переопределение.",
+                    phone,
+                    detail or "unknown",
+                )
+            elif code == "override_invalid":
+                log.warning(
+                    "[%s] proxy_override указано, но конфигурация некорректна. Пытаюсь использовать пользовательский или динамический прокси.",
+                    phone,
+                )
+            elif code == "tenant_invalid":
+                log.warning(
+                    "[%s] пользовательский прокси для пользователя настроен, но параметры некорректны. Подключение пойдёт без него или с глобальным прокси.",
+                    phone,
+                )
+
+    if changed:
+        persist_tenants()
+
+    return restarted, errors
+
+
 def _clone_buttons(buttons: Optional[List[List[Button]]]) -> Optional[List[List[Button]]]:
     if buttons is None:
         return None
@@ -1620,6 +1795,7 @@ async def ensure_menu_keyboard(admin_id: int) -> None:
 
 def main_menu():
     return [
+        [Button.inline("🌐 Прокси", b"proxy_menu")],
         [Button.inline("➕ Добавить аккаунт", b"add")],
         [Button.inline("📋 Список аккаунтов", b"list")],
         [Button.inline("📁 Файлы", b"files")],
@@ -1651,6 +1827,59 @@ def files_delete_menu() -> List[List[Button]]:
         [Button.inline("📹 Кружки", b"files_delete_video")],
         [Button.inline("⬅️ Назад", b"files_root")],
     ]
+
+
+def _mask_secret(value: Optional[str]) -> str:
+    if not value:
+        return "нет"
+    if len(value) <= 2:
+        return "*" * len(value)
+    return f"{value[0]}{'*' * (len(value) - 2)}{value[-1]}"
+
+
+def format_proxy_settings(owner_id: int) -> str:
+    cfg = get_tenant_proxy_config(owner_id)
+    if not cfg or not cfg.get("host"):
+        return (
+            "Прокси не настроен.\n"
+            "Нажми \"Добавить/Изменить\", чтобы указать данные провайдера перед добавлением аккаунтов."
+        )
+    lines = ["Текущие настройки прокси:"]
+    proxy_type = str(cfg.get("type", "HTTP")).upper()
+    lines.append(f"• Тип: {proxy_type}")
+    lines.append(f"• Адрес: {cfg.get('host')}:{cfg.get('port')}")
+    username = cfg.get("username")
+    password = cfg.get("password")
+    if username:
+        lines.append(f"• Логин: {username}")
+    if password:
+        lines.append(f"• Пароль: {_mask_secret(password)}")
+    if cfg.get("dynamic"):
+        lines.append("• Режим: динамический (новый IP по запросу провайдера)")
+    else:
+        lines.append("• Режим: статический")
+    updated_at = cfg.get("updated_at")
+    if updated_at:
+        try:
+            ts = datetime.fromtimestamp(updated_at)
+            lines.append(f"• Обновлено: {ts.strftime('%d.%m.%Y %H:%M:%S')}")
+        except Exception:
+            pass
+    return "\n".join(lines)
+
+
+def proxy_menu_buttons(owner_id: int) -> List[List[Button]]:
+    cfg = get_tenant_proxy_config(owner_id)
+    has_active = get_active_tenant_proxy(owner_id) is not None
+    has_config = bool(cfg)
+    rows: List[List[Button]] = []
+    rows.append([Button.inline("➕ Добавить/Изменить", b"proxy_set")])
+    if has_active:
+        rows.append([Button.inline("🔄 Обновить IP", b"proxy_refresh")])
+    if has_config:
+        rows.append([Button.inline("🚫 Отключить", b"proxy_clear")])
+    rows.append([Button.inline("⬅️ Назад", b"back")])
+    return rows
 
 def account_control_menu():
     return [
@@ -1697,6 +1926,65 @@ async def on_cb(ev):
 
     if data == "noop":
         await ev.answer()
+        return
+
+    if data == "proxy_menu":
+        await ev.answer()
+        await bot_client.send_message(
+            admin_id,
+            format_proxy_settings(admin_id),
+            buttons=proxy_menu_buttons(admin_id),
+        )
+        return
+
+    if data == "proxy_set":
+        pending[admin_id] = {"flow": "proxy", "step": "type", "data": {}}
+        await ev.answer()
+        await bot_client.send_message(
+            admin_id,
+            "Укажи тип прокси (SOCKS5/SOCKS4/HTTP):",
+        )
+        return
+
+    if data == "proxy_clear":
+        cfg = get_tenant_proxy_config(admin_id)
+        if not cfg or (not cfg.get("host") and not bool(cfg.get("enabled", True))):
+            await ev.answer("Прокси уже отключён", alert=True)
+            return
+        clear_tenant_proxy_config(admin_id)
+        await ev.answer()
+        restarted, errors = await apply_proxy_config_to_owner(admin_id, restart_active=True)
+        text_lines = ["🚫 Прокси для ваших аккаунтов отключён.", "", format_proxy_settings(admin_id)]
+        if restarted:
+            text_lines.append(f"Перезапущено активных аккаунтов: {restarted}.")
+        if errors:
+            text_lines.append("⚠️ Ошибки при обновлении: " + "; ".join(errors))
+        await bot_client.send_message(
+            admin_id,
+            "\n".join(text_lines),
+            buttons=proxy_menu_buttons(admin_id),
+        )
+        return
+
+    if data == "proxy_refresh":
+        if not get_active_tenant_proxy(admin_id):
+            await ev.answer("Сначала настройте прокси", alert=True)
+            return
+        await ev.answer()
+        restarted, errors = await apply_proxy_config_to_owner(admin_id, restart_active=True)
+        summary = [
+            "🔄 Переподключение аккаунтов выполнено."
+        ]
+        if restarted:
+            summary.append(f"Обновлено аккаунтов: {restarted}.")
+        if errors:
+            summary.append("⚠️ Ошибки: " + "; ".join(errors))
+        summary.extend(["", format_proxy_settings(admin_id)])
+        await bot_client.send_message(
+            admin_id,
+            "\n".join(summary),
+            buttons=proxy_menu_buttons(admin_id),
+        )
         return
 
     if data.startswith("ui_back:"):
@@ -1843,8 +2131,11 @@ async def on_cb(ev):
             else:
                 status = "⚠️"
                 note = " | неактивен"
+            proxy_label = m.get("proxy_desc") or "None"
+            if m.get("proxy_dynamic"):
+                proxy_label = f"{proxy_label} (dyn)"
             lines.append(
-                f"• {status} {p} | api:{m.get('api_id')} | dev:{m.get('device','')}{note}{note_extra}"
+                f"• {status} {p} | api:{m.get('api_id')} | dev:{m.get('device','')} | proxy:{proxy_label}{note}{note_extra}"
             )
         await ev.answer()
         await bot_client.send_message(admin_id, "\n".join(lines), buttons=account_control_menu())
@@ -2390,7 +2681,8 @@ async def on_text(ev):
     st = pending.get(admin_id)
 
     if st:
-        if st.get("flow") == "file":
+        flow = st.get("flow")
+        if flow == "file":
             file_type = st.get("file_type")
             if st.get("step") == "name":
                 if not text:
@@ -2468,7 +2760,108 @@ async def on_text(ev):
                 pending.pop(admin_id, None)
                 return
 
-        if st["step"] == "phone":
+        if flow == "proxy":
+            if text.lower() in {"отмена", "cancel", "стоп", "stop"}:
+                pending.pop(admin_id, None)
+                await ev.reply("Настройка прокси отменена.")
+                return
+            step = st.get("step")
+            data_store = st.setdefault("data", {})
+            if step == "type":
+                if not text:
+                    await ev.reply("Пришли тип прокси (SOCKS5/SOCKS4/HTTP).")
+                    return
+                proxy_type = text.strip().upper()
+                if proxy_type == "SOCKS":
+                    proxy_type = "SOCKS5"
+                if proxy_type not in {"SOCKS5", "SOCKS4", "HTTP"}:
+                    await ev.reply("Некорректный тип. Доступно: SOCKS5, SOCKS4 или HTTP.")
+                    return
+                data_store["type"] = proxy_type
+                pending[admin_id]["step"] = "host"
+                await ev.reply("Пришли адрес прокси (домен или IP).")
+                return
+            if step == "host":
+                host_value = text.strip()
+                if not host_value:
+                    await ev.reply("Адрес не может быть пустым. Попробуй ещё раз.")
+                    return
+                data_store["host"] = host_value
+                pending[admin_id]["step"] = "port"
+                await ev.reply("Укажи порт (1-65535).")
+                return
+            if step == "port":
+                try:
+                    port_value = int(text.strip())
+                except (TypeError, ValueError):
+                    await ev.reply("Порт должен быть числом.")
+                    return
+                if not (1 <= port_value <= 65535):
+                    await ev.reply("Порт вне диапазона 1-65535. Пришли корректное значение.")
+                    return
+                data_store["port"] = port_value
+                pending[admin_id]["step"] = "username"
+                await ev.reply("Укажи логин прокси (или -, если не требуется).")
+                return
+            if step == "username":
+                value = text.strip()
+                if value and value not in {"-", "нет", "no", "none", "без"}:
+                    data_store["username"] = value
+                else:
+                    data_store["username"] = None
+                pending[admin_id]["step"] = "password"
+                await ev.reply("Укажи пароль прокси (или -, если не требуется).")
+                return
+            if step == "password":
+                value = text.strip()
+                if value and value not in {"-", "нет", "no", "none", "без"}:
+                    data_store["password"] = value
+                else:
+                    data_store["password"] = None
+                pending[admin_id]["step"] = "dynamic"
+                await ev.reply("Прокси динамический? (да/нет)")
+                return
+            if step == "dynamic":
+                value = text.strip().lower()
+                if value in {"да", "yes", "y", "true", "1", "+"}:
+                    data_store["dynamic"] = True
+                elif value in {"нет", "no", "n", "false", "0", "-"}:
+                    data_store["dynamic"] = False
+                else:
+                    await ev.reply("Ответьте 'да' или 'нет'.")
+                    return
+                cfg = {
+                    "enabled": True,
+                    "type": data_store.get("type", "HTTP"),
+                    "host": data_store.get("host"),
+                    "port": data_store.get("port"),
+                    "username": data_store.get("username"),
+                    "password": data_store.get("password"),
+                    "rdns": True,
+                    "dynamic": bool(data_store.get("dynamic")),
+                    "updated_at": int(datetime.now().timestamp()),
+                }
+                if not cfg.get("username"):
+                    cfg.pop("username", None)
+                if not cfg.get("password"):
+                    cfg.pop("password", None)
+                set_tenant_proxy_config(admin_id, cfg)
+                pending.pop(admin_id, None)
+                restarted, errors = await apply_proxy_config_to_owner(admin_id, restart_active=True)
+                response_lines = ["✅ Прокси сохранён.", "", format_proxy_settings(admin_id)]
+                if restarted:
+                    response_lines.append(f"Перезапущено активных аккаунтов: {restarted}.")
+                if errors:
+                    response_lines.append("⚠️ Ошибки при обновлении: " + "; ".join(errors))
+                await ev.reply("\n".join(response_lines))
+                await bot_client.send_message(
+                    admin_id,
+                    "Готово. Управление прокси:",
+                    buttons=proxy_menu_buttons(admin_id),
+                )
+                return
+
+        if st.get("step") == "phone":
             phone = text
             if not phone.startswith("+") or len(phone)<8:
                 await ev.reply("Неверный формат. Пример: +7XXXXXXXXXX"); return
