@@ -11,6 +11,7 @@ import html
 import re
 import shutil
 import socket
+import mimetypes
 from datetime import datetime
 from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
@@ -166,6 +167,7 @@ ITEMS_PER_PAGE = 10
 ACCOUNTS_META = "accounts.json"
 ROTATION_STATE = ".rotation_state.json"
 TENANTS_DB = "tenants.json"
+MAX_MEDIA_FORWARD_SIZE = 20 * 1024 * 1024  # 20 MB
 
 
 def _ensure_dict(value: Any) -> Dict[str, Any]:
@@ -1006,6 +1008,62 @@ def _extract_event_user_id(ev: Any) -> Optional[int]:
     return None
 
 
+def _format_filesize(size: Optional[int]) -> str:
+    if not size:
+        return ""
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if size < 1024 or unit == "ГБ":
+            return f"{size:.1f} {unit}" if unit != "Б" else f"{size} {unit}"
+        size /= 1024
+    return f"{size:.1f} ГБ"
+
+
+def _describe_media(event: Any) -> Tuple[str, str]:
+    checks: List[Tuple[str, str, str]] = [
+        ("voice", "voice", "Голосовое сообщение"),
+        ("video_note", "video_note", "Видеосообщение (кружок)"),
+        ("video", "video", "Видео"),
+        ("audio", "audio", "Аудио"),
+        ("photo", "photo", "Фотография"),
+        ("gif", "gif", "GIF"),
+        ("sticker", "sticker", "Стикер"),
+        ("document", "document", "Документ"),
+    ]
+    for attr, code, description in checks:
+        if getattr(event, attr, None):
+            return code, description
+    if getattr(event, "media", None):
+        return "media", "Медиа"
+    return "", ""
+
+
+def _resolve_media_filename(event: Any, media_code: str) -> str:
+    file_obj = getattr(event, "file", None)
+    if file_obj is not None:
+        name = getattr(file_obj, "name", None)
+        if name:
+            return name
+        ext = getattr(file_obj, "ext", None) or ""
+        if not ext:
+            mime_type = getattr(file_obj, "mime_type", None)
+            if mime_type:
+                ext = mimetypes.guess_extension(mime_type) or ""
+        if not ext:
+            fallback_map = {
+                "voice": ".ogg",
+                "video_note": ".mp4",
+                "video": ".mp4",
+                "photo": ".jpg",
+                "audio": ".mp3",
+                "gif": ".gif",
+            }
+            ext = fallback_map.get(media_code, "")
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        return f"{media_code or 'media'}_{timestamp}{ext}"
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    return f"media_{timestamp}"
+
+
 async def safe_send_admin(text: str, *, owner_id: Optional[int] = None, **kwargs):
     targets = {owner_id} if owner_id is not None else all_admin_ids()
     for admin_id in targets:
@@ -1445,7 +1503,7 @@ class AccountWorker:
 
             @self.client.on(events.NewMessage(incoming=True))
             async def on_new(ev):
-                txt = ev.raw_text or "<media>"
+                txt = ev.raw_text or ""
                 ctx_id = secrets.token_hex(4)
                 peer = None
                 try:
@@ -1473,12 +1531,64 @@ class AccountWorker:
                     f"🔗 {html.escape(tag_value)}",
                     f"ID Собеседника: {html.escape(sender_id_display)}",
                 ]
+                media_bytes: Optional[bytes] = None
+                media_filename: Optional[str] = None
+                media_description: Optional[str] = None
+                media_notice: Optional[str] = None
+                media_code, media_description_raw = _describe_media(ev)
+                file_obj = getattr(ev, "file", None)
+                media_size = getattr(file_obj, "size", None)
+                has_media = bool(getattr(ev, "media", None))
+                if media_description_raw:
+                    media_description = media_description_raw
+                elif has_media:
+                    media_description = "Медиа"
+                if media_description:
+                    size_display = _format_filesize(media_size)
+                    description_line = f"🗂 Вложение: <b>{html.escape(media_description)}</b>"
+                    if size_display:
+                        description_line += f" ({size_display})"
+                    info_lines.append(description_line)
+                if has_media:
+                    if media_size and media_size > MAX_MEDIA_FORWARD_SIZE:
+                        formatted_limit = _format_filesize(MAX_MEDIA_FORWARD_SIZE)
+                        formatted_size = _format_filesize(media_size)
+                        media_notice = (
+                            f"⚠️ Файл {html.escape(media_description or 'медиа')} "
+                            f"({formatted_size}) превышает лимит авто-перенаправления"
+                            f" ({formatted_limit})."
+                        )
+                    else:
+                        buffer = BytesIO()
+                        try:
+                            downloaded = await ev.download_media(file=buffer)
+                            if downloaded is not None:
+                                media_bytes = buffer.getvalue()
+                        except Exception as download_error:
+                            media_notice = (
+                                "⚠️ Не удалось скачать вложение: "
+                                f"{html.escape(str(download_error))}"
+                            )
+                        finally:
+                            buffer.close()
+                        if media_bytes:
+                            media_filename = _resolve_media_filename(ev, media_code)
+                        elif media_notice is None:
+                            media_notice = "⚠️ Вложение не удалось скачать."
+                if media_notice:
+                    info_lines.extend(["", media_notice])
                 if txt:
                     escaped_txt = html.escape(txt)
                     info_lines.extend([
                         "",
                         "💬 <b>Сообщение:</b>",
                         escaped_txt,
+                    ])
+                else:
+                    info_lines.extend([
+                        "",
+                        "💬 <b>Сообщение:</b>",
+                        "<i>Без текста</i>",
                     ])
                 info_caption = "\n".join(info_lines)
 
@@ -1497,6 +1607,22 @@ class AccountWorker:
                     ],
                     [Button.inline("🚫 Заблокировать", f"block_contact:{ctx_id}".encode())],
                 ]
+                if media_bytes and media_filename:
+                    media_caption_lines = [
+                        f"👤 Аккаунт: <b>{html.escape(account_display)}</b>",
+                        f"👥 Собеседник: <b>{html.escape(sender_name) if sender_name else '—'}</b>",
+                    ]
+                    if media_description:
+                        media_caption_lines.append(
+                            f"📎 {html.escape(media_description)}"
+                        )
+                    await safe_send_admin_file(
+                        media_bytes,
+                        media_filename,
+                        owner_id=self.owner_id,
+                        caption="\n".join(media_caption_lines),
+                        parse_mode="html",
+                    )
                 await safe_send_admin(
                     info_caption,
                     buttons=buttons,
