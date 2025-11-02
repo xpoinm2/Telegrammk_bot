@@ -499,11 +499,22 @@ if _tenants_initially_empty:
         persist_tenants()
 
 # Параметры имитации активности перед отправкой
-TYPING_CHAR_SPEED = (7.0, 14.0)  # символов в секунду
-TYPING_DURATION_LIMITS = (0.6, 4.0)  # минимальная и максимальная продолжительность «печати»
-TYPING_DURATION_VARIANCE = (0.85, 1.2)
-VOICE_RECORD_DURATION = (2.0, 4.0)  # секунд имитации записи голосового
-VIDEO_NOTE_RECORD_DURATION = (2.0, 4.0)  # секунд имитации записи кружка
+TYPING_CHAR_SPEED = (8.5, 14.5)  # символов в секунду
+TYPING_WORD_DELAY = (0.28, 0.42)  # сек. на слово как альтернативная оценка
+TYPING_BASE_DELAY = (0.7, 1.3)  # небольшое постоянное смещение
+TYPING_NEWLINE_DELAY = (0.45, 1.0)  # штраф за перевод строки
+TYPING_DURATION_LIMITS = (1.2, 35.0)  # минимальная и максимальная продолжительность «печати»
+TYPING_DURATION_VARIANCE = (0.9, 1.2)
+VOICE_RECORD_LIMITS = (3.0, 45.0)
+VOICE_RECORD_BYTES_PER_SECOND = (2800.0, 5200.0)
+VOICE_RECORD_FALLBACK = (8.0, 16.0)
+VOICE_RECORD_EXTRA_DELAY = (1.2, 2.4)
+VOICE_RECORD_VARIANCE = (0.9, 1.15)
+VIDEO_NOTE_RECORD_LIMITS = (3.0, 55.0)
+VIDEO_NOTE_BYTES_PER_SECOND = (60000.0, 110000.0)
+VIDEO_NOTE_FALLBACK = (9.0, 18.0)
+VIDEO_NOTE_EXTRA_DELAY = (1.4, 2.8)
+VIDEO_NOTE_VARIANCE = (0.92, 1.18)
 CHAT_ACTION_REFRESH = 4.5  # секунды между повторными действиями, если требуется
 # ============================================
 
@@ -515,16 +526,84 @@ def _rand_delay(span: Tuple[int, int]) -> float:
 
 def _typing_duration(message: str) -> float:
     message = message or ""
+    stripped = message.strip()
     variance = random.uniform(*TYPING_DURATION_VARIANCE)
-    if message:
-        speed = random.uniform(*TYPING_CHAR_SPEED)
-        estimated = len(message) / max(speed, 1e-3)
-        duration = estimated * variance
+    low_limit, high_limit = TYPING_DURATION_LIMITS
+
+    if not stripped:
+        base = random.uniform(*TYPING_BASE_DELAY)
+        return max(low_limit, min(base * variance, high_limit))
+
+    char_count = len(message)
+    word_count = len(stripped.split())
+    line_breaks = message.count("\n")
+
+    speed = random.uniform(*TYPING_CHAR_SPEED)
+    char_component = char_count / max(speed, 1e-3)
+
+    word_delay = random.uniform(*TYPING_WORD_DELAY)
+    word_component = word_count * word_delay if word_count else 0.0
+
+    base_delay = random.uniform(*TYPING_BASE_DELAY)
+    newline_penalty = line_breaks * random.uniform(*TYPING_NEWLINE_DELAY) if line_breaks else 0.0
+
+    duration = max(char_component, word_component) + base_delay + newline_penalty
+    duration *= variance
+
+    return max(low_limit, min(duration, high_limit))
+
+
+def _media_recording_duration(
+    file_path: Optional[str],
+    bytes_per_second_range: Tuple[float, float],
+    fallback_range: Tuple[float, float],
+    limits: Tuple[float, float],
+    extra_delay_range: Tuple[float, float],
+    variance_range: Tuple[float, float],
+) -> float:
+    low_limit, high_limit = limits
+    variance = random.uniform(*variance_range)
+    extra = random.uniform(*extra_delay_range)
+
+    size = 0
+    if file_path:
+        with contextlib.suppress(OSError):
+            size = os.path.getsize(file_path)
+
+    bps_low, bps_high = bytes_per_second_range
+    duration: float
+    if size > 0 and bps_low > 0 and bps_high > 0:
+        bps_high = max(bps_high, bps_low)
+        bps = random.uniform(bps_low, bps_high)
+        duration = size / max(bps, 1.0)
     else:
-        low, high = TYPING_DURATION_LIMITS
-        duration = random.uniform(low, min(high, low + 0.5)) * variance
-    low, high = TYPING_DURATION_LIMITS
-    return max(low, min(duration, high))
+        duration = random.uniform(*fallback_range)
+
+    duration = (duration + extra) * variance
+    return max(low_limit, min(duration, high_limit))
+
+
+def _voice_record_duration(file_path: Optional[str]) -> float:
+    return _media_recording_duration(
+        file_path,
+        VOICE_RECORD_BYTES_PER_SECOND,
+        VOICE_RECORD_FALLBACK,
+        VOICE_RECORD_LIMITS,
+        VOICE_RECORD_EXTRA_DELAY,
+        VOICE_RECORD_VARIANCE,
+    )
+
+
+def _video_note_record_duration(file_path: Optional[str]) -> float:
+    return _media_recording_duration(
+        file_path,
+        VIDEO_NOTE_BYTES_PER_SECOND,
+        VIDEO_NOTE_FALLBACK,
+        VIDEO_NOTE_RECORD_LIMITS,
+        VIDEO_NOTE_EXTRA_DELAY,
+        VIDEO_NOTE_VARIANCE,
+    )
+
 
 def _list_files(directory: str, allowed_ext: Set[str]) -> List[str]:
     if not os.path.isdir(directory):
@@ -1312,18 +1391,16 @@ class AccountWorker:
         duration = _typing_duration(message)
         await self._simulate_chat_action(client, peer, "typing", duration)
 
-    async def _simulate_voice_recording(self, client: TelegramClient, peer: Any) -> None:
-        if VOICE_RECORD_DURATION[0] < VOICE_RECORD_DURATION[1]:
-            duration = random.uniform(*VOICE_RECORD_DURATION)
-        else:
-            duration = float(VOICE_RECORD_DURATION[0])
+    async def _simulate_voice_recording(
+        self, client: TelegramClient, peer: Any, file_path: Optional[str] = None
+    ) -> None:
+        duration = _voice_record_duration(file_path)
         await self._simulate_chat_action(client, peer, "record-audio", duration)
 
-    async def _simulate_round_recording(self, client: TelegramClient, peer: Any) -> None:
-        if VIDEO_NOTE_RECORD_DURATION[0] < VIDEO_NOTE_RECORD_DURATION[1]:
-            duration = random.uniform(*VIDEO_NOTE_RECORD_DURATION)
-        else:
-            duration = float(VIDEO_NOTE_RECORD_DURATION[0])
+    async def _simulate_round_recording(
+        self, client: TelegramClient, peer: Any, file_path: Optional[str] = None
+    ) -> None:
+        duration = _video_note_record_duration(file_path)
         await self._simulate_chat_action(client, peer, "record-round", duration)
 
     async def _ensure_client(self) -> TelegramClient:
@@ -1611,7 +1688,7 @@ class AccountWorker:
                 peer = await client.get_input_entity(chat_id)
             except Exception:
                 peer = chat_id
-        await self._simulate_voice_recording(client, peer)
+        await self._simulate_voice_recording(client, peer, file_path)
         try:
             await client.send_file(
                 peer,
@@ -1645,7 +1722,7 @@ class AccountWorker:
                 peer = await client.get_input_entity(chat_id)
             except Exception:
                 peer = chat_id
-        await self._simulate_round_recording(client, peer)
+        await self._simulate_round_recording(client, peer, file_path)
         try:
             await client.send_file(
                 peer,
