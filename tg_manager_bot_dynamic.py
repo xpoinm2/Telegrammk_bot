@@ -157,7 +157,7 @@ VOICES_DIR = os.path.join(LIBRARY_DIR, "voices")
 VIDEO_DIR = os.path.join(LIBRARY_DIR, "video")
 PROXIES_DIR = os.path.join(LIBRARY_DIR, "proxies")
 TEXT_EXTENSIONS = {".txt", ".md"}
-VOICE_EXTENSIONS = {".ogg", ".oga"}
+VOICE_EXTENSIONS = {".ogg", ".oga", ".mp3"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
 for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR, PROXIES_DIR):
     os.makedirs(_dir, exist_ok=True)
@@ -3451,7 +3451,9 @@ async def on_text(ev):
                 msg = ev.message
                 if file_type == "voice":
                     if not getattr(msg, "voice", None):
-                        await ev.reply("Ожидается голосовое сообщение в формате .ogg.")
+                        await ev.reply(
+                            "Ожидается голосовое сообщение (поддерживаются .ogg, .oga, .mp3)."
+                        )
                         return
                     ext = ".ogg"
                     if msg.file and msg.file.ext:
