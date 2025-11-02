@@ -156,7 +156,7 @@ VOICES_DIR = os.path.join(LIBRARY_DIR, "voices")
 VIDEO_DIR = os.path.join(LIBRARY_DIR, "video")
 PROXIES_DIR = os.path.join(LIBRARY_DIR, "proxies")
 TEXT_EXTENSIONS = {".txt", ".md"}
-VOICE_EXTENSIONS = {".ogg"}
+VOICE_EXTENSIONS = {".ogg", ".oga"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
 for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR, PROXIES_DIR):
     os.makedirs(_dir, exist_ok=True)
@@ -685,16 +685,44 @@ def sanitize_filename(name: str, default: str = "file") -> str:
     return cleaned or default
 
 
+def _list_user_and_shared_files(owner_id: int, kind: str, allowed_ext: Set[str]) -> List[str]:
+    """Return files from the personal library with a fallback to the shared one.
+
+    Earlier versions of the bot stored assets directly in ``library/<kind>``.
+    Newer builds keep user-specific copies in ``library/<user>/<kind>`` to avoid
+    name collisions.  Some users still place their files in the legacy shared
+    folders manually, so we merge both locations to ensure compatibility.
+    Personal files always appear first, and duplicates (matched by full path)
+    are ignored when adding shared files.
+    """
+
+    personal_dir = user_library_dir(owner_id, kind)
+    shared_dir = os.path.join(LIBRARY_DIR, kind)
+
+    files = _list_files(personal_dir, allowed_ext)
+
+    # Avoid duplicates if personal_dir and shared_dir accidentally point to the
+    # same location or contain identical files.  ``os.path.normpath`` is used to
+    # compare directories on platforms with different path separators.
+    if os.path.normpath(personal_dir) != os.path.normpath(shared_dir):
+        shared_files = _list_files(shared_dir, allowed_ext)
+        for path in shared_files:
+            if path not in files:
+                files.append(path)
+
+    return files
+
+
 def list_text_templates(owner_id: int) -> List[str]:
-    return _list_files(user_library_dir(owner_id, "pastes"), TEXT_EXTENSIONS)
+    return _list_user_and_shared_files(owner_id, "pastes", TEXT_EXTENSIONS)
 
 
 def list_voice_templates(owner_id: int) -> List[str]:
-    return _list_files(user_library_dir(owner_id, "voices"), VOICE_EXTENSIONS)
+    return _list_user_and_shared_files(owner_id, "voices", VOICE_EXTENSIONS)
 
 
 def list_video_templates(owner_id: int) -> List[str]:
-    return _list_files(user_library_dir(owner_id, "video"), VIDEO_EXTENSIONS)
+    return _list_user_and_shared_files(owner_id, "video", VIDEO_EXTENSIONS)
 
 
 FILE_TYPE_LABELS = {
