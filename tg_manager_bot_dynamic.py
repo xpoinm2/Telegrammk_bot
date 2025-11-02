@@ -4208,7 +4208,7 @@ async def startup():
                 log.warning("Worker %s session invalid; waiting for re-login.", phone)
             except Exception as e:
                 log.warning("Worker %s not started yet: %s", phone, e)
-    await safe_send_admin("🚀 Бот запущен. /start", buttons=main_menu())
+    log.info("Startup notification suppressed to avoid spamming users.")
 
 def main():
     loop = asyncio.get_event_loop()
