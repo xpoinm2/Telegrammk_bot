@@ -516,11 +516,11 @@ TYPING_BASE_DELAY = (0.7, 1.3)  # небольшое постоянное сме
 TYPING_NEWLINE_DELAY = (0.45, 1.0)  # штраф за перевод строки
 TYPING_DURATION_LIMITS = (1.2, 35.0)  # минимальная и максимальная продолжительность «печати»
 TYPING_DURATION_VARIANCE = (0.9, 1.2)
-VOICE_RECORD_LIMITS = (3.0, 45.0)
-VOICE_RECORD_BYTES_PER_SECOND = (2800.0, 5200.0)
-VOICE_RECORD_FALLBACK = (8.0, 16.0)
-VOICE_RECORD_EXTRA_DELAY = (1.2, 2.4)
-VOICE_RECORD_VARIANCE = (0.9, 1.15)
+VOICE_RECORD_LIMITS = (2.0, 45.0)
+VOICE_RECORD_BYTES_PER_SECOND = (15000.0, 26000.0)
+VOICE_RECORD_FALLBACK = (5.0, 10.0)
+VOICE_RECORD_EXTRA_DELAY = (0.6, 1.4)
+VOICE_RECORD_VARIANCE = (0.9, 1.05)
 VIDEO_NOTE_RECORD_LIMITS = (3.0, 55.0)
 VIDEO_NOTE_BYTES_PER_SECOND = (60000.0, 110000.0)
 VIDEO_NOTE_FALLBACK = (9.0, 18.0)
@@ -759,6 +759,31 @@ def user_library_subdir(owner_id: int, file_type: str) -> Optional[str]:
     if file_type == "video":
         return user_library_dir(owner_id, "video")
     return None
+
+
+def _is_path_within(path: str, base: str) -> bool:
+    if not base:
+        return False
+    abs_base = os.path.abspath(base)
+    abs_path = os.path.abspath(path)
+    try:
+        return os.path.commonpath([abs_base, abs_path]) == abs_base
+    except ValueError:
+        return False
+
+
+def _allowed_template_directories(owner_id: int, file_type: str) -> List[str]:
+    directories: List[str] = []
+    personal = user_library_subdir(owner_id, file_type)
+    if personal:
+        directories.append(personal)
+    if file_type == "paste":
+        directories.append(PASTES_DIR)
+    elif file_type == "voice":
+        directories.append(VOICES_DIR)
+    elif file_type == "video":
+        directories.append(VIDEO_DIR)
+    return directories
 
 
 def build_file_delete_keyboard(
@@ -2788,10 +2813,6 @@ async def on_cb(ev):
             page = int(page_str)
         except ValueError:
             page = 0
-        base_dir = user_library_subdir(admin_id, file_type)
-        if not base_dir:
-            await ev.answer("Неизвестный тип", alert=True)
-            return
         path = _resolve_payload(encoded)
         if path is None:
             try:
@@ -2799,9 +2820,13 @@ async def on_cb(ev):
             except Exception:
                 await ev.answer("Некорректные данные", alert=True)
                 return
-        abs_base = os.path.abspath(base_dir)
         abs_path = os.path.abspath(path)
-        if os.path.commonpath([abs_base, abs_path]) != abs_base:
+        allowed_dirs = [
+            os.path.abspath(d)
+            for d in _allowed_template_directories(admin_id, file_type)
+            if d
+        ]
+        if not any(_is_path_within(abs_path, base) for base in allowed_dirs):
             await ev.answer("Удаление запрещено", alert=True)
             return
         try:
