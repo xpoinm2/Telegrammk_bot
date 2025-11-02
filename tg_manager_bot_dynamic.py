@@ -1688,6 +1688,7 @@ class AccountWorker:
                 buttons: List[List[Button]] = [
                     [
                         Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
+                        Button.inline("👀 Прочитать", f"mark_read:{ctx_id}".encode()),
                         Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
                     ],
                     [Button.inline("🚫 Заблокировать", f"block_contact:{ctx_id}".encode())],
@@ -1950,6 +1951,25 @@ class AccountWorker:
         except UserDeactivatedError as e:
             await self._handle_account_disabled("frozen", e)
             raise RuntimeError("Аккаунт заморожен Telegram")
+
+    async def mark_dialog_read(
+        self,
+        chat_id: int,
+        peer: Optional[Any] = None,
+        msg_id: Optional[int] = None,
+    ) -> None:
+        client = await self._ensure_client()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Аккаунт не авторизован")
+        if peer is None:
+            try:
+                peer = await client.get_input_entity(chat_id)
+            except Exception:
+                peer = chat_id
+        try:
+            await client.send_read_acknowledge(peer, max_id=msg_id)
+        except Exception as e:
+            log.debug("[%s] failed to mark dialog read: %s", self.phone, e)
 
     async def send_reaction(
         self,
@@ -2286,6 +2306,24 @@ def get_reply_context_for_admin(ctx_id: str, admin_id: int) -> Optional[Dict[str
     if ctx.get("owner_id") != admin_id:
         return None
     return ctx
+
+async def mark_dialog_read_for_context(ctx_info: Dict[str, Any]) -> None:
+    worker = get_worker(ctx_info["owner_id"], ctx_info["phone"])
+    if not worker:
+        return
+    try:
+        await worker.mark_dialog_read(
+            ctx_info["chat_id"],
+            ctx_info.get("peer"),
+            ctx_info.get("msg_id"),
+        )
+    except Exception as e:
+        log.debug(
+            "[%s] unable to mark dialog read for chat %s: %s",
+            ctx_info.get("phone"),
+            ctx_info.get("chat_id"),
+            e,
+        )
 
 async def cancel_operations(admin_id: int, notify: bool = True) -> bool:
     """Сбрасывает незавершённые операции для конкретного админа."""
@@ -2917,18 +2955,29 @@ async def on_cb(ev):
             await bot_client.send_message(admin_id, f"❌ {phone} не отвечает. Проверь подключение.", buttons=main_menu())
         return
 
-    if data.startswith("reply:") or data.startswith("reply_to:"):
+    if data.startswith("mark_read:"):
         ctx = data.split(":", 1)[1]
-        if ctx not in reply_contexts:
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
+        await mark_dialog_read_for_context(ctx_info)
+        await ev.answer("Диалог помечен прочитанным")
+        return
+
+    if data.startswith("reply:") or data.startswith("reply_to:"):
+        ctx = data.split(":", 1)[1]
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        await mark_dialog_read_for_context(ctx_info)
         if reply_waiting.get(admin_id):
             await ev.answer("Уже жду сообщение", alert=True)
             return
         mode = "reply" if data.startswith("reply_to:") else "normal"
         reply_waiting[admin_id] = {"ctx": ctx, "mode": mode}
         await ev.answer()
-        ctx_info = reply_contexts[ctx]
         await show_interactive_message(
             admin_id,
             build_reply_prompt(ctx_info, mode),
@@ -2945,7 +2994,8 @@ async def on_cb(ev):
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
-            return
+            return\
+        await mark_dialog_read_for_context(ctx_info)
         if mode != "reply":
             await ev.answer("Реакции доступны только для реплая", alert=True)
             return
@@ -2969,6 +3019,7 @@ async def on_cb(ev):
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
+        await mark_dialog_read_for_context(ctx_info)
         reply_waiting[admin_id] = {"ctx": ctx, "mode": mode}
         await ev.answer()
         await show_interactive_message(
@@ -3000,6 +3051,7 @@ async def on_cb(ev):
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
+        await mark_dialog_read_for_context(ctx_info)
         msg_id = ctx_info.get("msg_id")
         if msg_id is None:
             await ev.answer("Сообщение недоступно", alert=True)
@@ -3027,6 +3079,10 @@ async def on_cb(ev):
         return
 
     if data.startswith("reply_cancel:"):
+        ctx = data.split(":", 1)[1]
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if ctx_info:
+            await mark_dialog_read_for_context(ctx_info)
         await ev.answer()
         await bot_client.send_message(admin_id, "❌ Ответ отменён.")
         return
@@ -3037,6 +3093,7 @@ async def on_cb(ev):
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
+        await mark_dialog_read_for_context(ctx_info)
         worker = get_worker(admin_id, ctx_info["phone"])
         if not worker:
             await ev.answer("Аккаунт недоступен", alert=True)
@@ -3068,6 +3125,7 @@ async def on_cb(ev):
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
+        await mark_dialog_read_for_context(ctx_info)
         owner_for_ctx = ctx_info["owner_id"]
         if data.startswith("reply_paste_menu:"):
             files = list_text_templates(owner_for_ctx)
@@ -3112,6 +3170,7 @@ async def on_cb(ev):
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
+        await mark_dialog_read_for_context(ctx_info)
         try:
             idx = int(idx_str)
         except ValueError:
@@ -3167,6 +3226,7 @@ async def on_cb(ev):
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
+        await mark_dialog_read_for_context(ctx_info)
         try:
             idx = int(idx_str)
         except ValueError:
@@ -3213,6 +3273,7 @@ async def on_cb(ev):
         if not ctx_info:
             await ev.answer("Контекст истёк", alert=True)
             return
+        await mark_dialog_read_for_context(ctx_info)
         try:
             idx = int(idx_str)
         except ValueError:
