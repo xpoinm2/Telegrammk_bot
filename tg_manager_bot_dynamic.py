@@ -25,6 +25,10 @@ from telethon.errors import (
     FloodWaitError,
     PeerIdInvalidError,
 )
+try:  # Telethon <= 1.33.1
+    from telethon.errors import QueryIdInvalidError  # type: ignore[attr-defined]
+except ImportError:  # Telethon >= 1.34 moved/renamed the error
+    from telethon.errors.rpcerrorlist import QueryIdInvalidError  # type: ignore[attr-defined]
 from telethon.tl.types import ReactionEmoji
 try:  # Telethon <= 1.33.1
     from telethon.errors import AuthKeyDuplicatedError  # type: ignore[attr-defined]
@@ -1180,6 +1184,24 @@ async def safe_send_admin_file(file_data: bytes, filename: str, *, owner_id: Opt
             )
             continue
 
+
+async def answer_callback(event: events.CallbackQuery.Event, *args, **kwargs):
+    try:
+        return await event.answer(*args, **kwargs)
+    except QueryIdInvalidError:
+        raw = getattr(event, "data", None)
+        if isinstance(raw, bytes):
+            data_repr = raw.decode("utf-8", errors="replace")
+        else:
+            data_repr = str(raw)
+        log.warning(
+            "Callback query already handled or expired for %s (data=%s)",
+            getattr(event, "sender_id", None),
+            data_repr,
+        )
+    return None
+
+
 def resolve_proxy_for_account(owner_id: int, phone: str, meta: Dict[str, Any]) -> Dict[str, Any]:
     raw_override = meta.get("proxy_override")
     override_signature = "__none__"
@@ -2299,6 +2321,68 @@ def unregister_worker(owner_id: int, phone: str) -> None:
         WORKERS.pop(owner_id, None)
 
 
+async def ensure_worker_running(owner_id: int, phone: str) -> Optional[AccountWorker]:
+    worker = get_worker(owner_id, phone)
+    if worker and worker.started:
+        return worker
+    if worker and not worker.started:
+        try:
+            await worker.start()
+            if worker.started:
+                return worker
+        except AuthKeyDuplicatedError:
+            log.warning("[%s] session invalid while restarting worker", phone)
+            unregister_worker(owner_id, phone)
+            return None
+        except Exception as exc:
+            log.warning("[%s] failed to restart worker: %s", phone, exc)
+    meta = get_account_meta(owner_id, phone)
+    if not meta:
+        return None
+    session_path = meta.get("session_file") or user_session_path(owner_id, phone)
+    session_data: Optional[str] = None
+    if session_path and os.path.exists(session_path):
+        try:
+            with open(session_path, "r", encoding="utf-8") as fh:
+                session_data = fh.read().strip() or None
+        except OSError as exc:
+            log.warning("[%s] cannot read session file %s: %s", phone, session_path, exc)
+    api_id = meta.get("api_id")
+    api_hash: Optional[str] = None
+    try:
+        api_id = int(api_id)
+    except (TypeError, ValueError):
+        api_id = API_KEYS[0]["api_id"] if API_KEYS else 0
+    for creds in API_KEYS:
+        if creds.get("api_id") == api_id:
+            api_hash = creds.get("api_hash")
+            break
+    if api_hash is None and API_KEYS:
+        api_id = API_KEYS[0]["api_id"]
+        api_hash = API_KEYS[0]["api_hash"]
+    device_name = meta.get("device")
+    device = next(
+        (d for d in DEVICE_PROFILES if d.get("device_model") == device_name),
+        DEVICE_PROFILES[0] if DEVICE_PROFILES else {},
+    )
+    if api_hash is None:
+        log.warning("[%s] cannot restore worker: API hash not configured", phone)
+        return worker
+    worker = AccountWorker(owner_id, phone, api_id, api_hash, device, session_data)
+    register_worker(owner_id, phone, worker)
+    try:
+        await worker.start()
+    except AuthKeyDuplicatedError:
+        log.warning("[%s] session invalid during worker restore", phone)
+        unregister_worker(owner_id, phone)
+        return None
+    except Exception as exc:
+        log.warning("[%s] failed to start worker on demand: %s", phone, exc)
+        unregister_worker(owner_id, phone)
+        return None
+    return worker
+
+
 def get_reply_context_for_admin(ctx_id: str, admin_id: int) -> Optional[Dict[str, Any]]:
     ctx = reply_contexts.get(ctx_id)
     if not ctx:
@@ -2485,7 +2569,7 @@ async def on_start(ev):
 async def on_cb(ev):
     admin_id = _extract_event_user_id(ev)
     if admin_id is None or not is_admin(admin_id):
-        await ev.answer("Недоступно", alert=True); return
+        await answer_callback(ev, "Недоступно", alert=True); return
     data = ev.data.decode() if isinstance(ev.data, (bytes, bytearray)) else str(ev.data)
 
     notify_cancel = not data.startswith(("reply", "ui_back"))
@@ -2493,11 +2577,11 @@ async def on_cb(ev):
     await ensure_menu_keyboard(admin_id)
 
     if data == "noop":
-        await ev.answer()
+        await answer_callback(ev)
         return
 
     if data == "proxy_menu":
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(
             admin_id,
             format_proxy_settings(admin_id),
@@ -2507,7 +2591,7 @@ async def on_cb(ev):
 
     if data == "proxy_set":
         pending[admin_id] = {"flow": "proxy", "step": "type", "data": {}}
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(
             admin_id,
             "Укажи тип прокси (SOCKS5/SOCKS4/HTTP):",
@@ -2517,10 +2601,10 @@ async def on_cb(ev):
     if data == "proxy_clear":
         cfg = get_tenant_proxy_config(admin_id)
         if not cfg or (not cfg.get("host") and not bool(cfg.get("enabled", True))):
-            await ev.answer("Прокси уже отключён", alert=True)
+            await answer_callback(ev, "Прокси уже отключён", alert=True)
             return
         clear_tenant_proxy_config(admin_id)
-        await ev.answer()
+        await answer_callback(ev)
         restarted, errors = await apply_proxy_config_to_owner(admin_id, restart_active=True)
         text_lines = ["🚫 Прокси для ваших аккаунтов отключён.", "", format_proxy_settings(admin_id)]
         if restarted:
@@ -2536,9 +2620,9 @@ async def on_cb(ev):
 
     if data == "proxy_refresh":
         if not get_active_tenant_proxy(admin_id):
-            await ev.answer("Сначала настройте прокси", alert=True)
+            await answer_callback(ev, "Сначала настройте прокси", alert=True)
             return
-        await ev.answer()
+        await answer_callback(ev)
         restarted, errors = await apply_proxy_config_to_owner(admin_id, restart_active=True)
         summary = [
             "🔄 Переподключение аккаунтов выполнено."
@@ -2559,53 +2643,53 @@ async def on_cb(ev):
         session_id = data.split(":", 1)[1]
         success, reason = await interactive_go_back(admin_id, session_id)
         if success:
-            await ev.answer()
+            await answer_callback(ev)
         else:
             if reason == "expired":
-                await ev.answer("Сообщение устарело", alert=True)
+                await answer_callback(ev, "Сообщение устарело", alert=True)
             else:
-                await ev.answer("Возврат недоступен", alert=True)
+                await answer_callback(ev, "Возврат недоступен", alert=True)
         return
 
     if data.startswith("usernoop:"):
         _, user_id_str = data.split(":", 1)
-        await ev.answer(f"ID: {user_id_str}")
+        await answer_callback(ev, f"ID: {user_id_str}")
         return
 
     if data == "userlist_close":
-        await ev.answer()
+        await answer_callback(ev)
         with contextlib.suppress(Exception):
             await ev.edit("Список закрыт.", buttons=None)
         return
 
     if data.startswith("userblock:"):
         if not is_root_admin(admin_id):
-            await ev.answer("Недостаточно прав", alert=True)
+            await answer_callback(ev, "Недостаточно прав", alert=True)
             return
         try:
             target_id = int(data.split(":", 1)[1])
         except (TypeError, ValueError):
-            await ev.answer("Некорректный ID", alert=True)
+            await answer_callback(ev, "Некорректный ID", alert=True)
             return
         if is_root_admin(target_id):
-            await ev.answer("Нельзя отключить супер-администратора.", alert=True)
+            await answer_callback(ev, "Нельзя отключить супер-администратора.", alert=True)
             return
         tenant_data = tenants.get(tenant_key(target_id))
         if not tenant_data:
-            await ev.answer("Пользователь не найден.", alert=True)
+            await answer_callback(ev, "Пользователь не найден.", alert=True)
             return
         await clear_owner_runtime(target_id)
         archive_user_data(target_id)
         if remove_tenant(target_id):
             await safe_send_admin("Ваш доступ к менеджеру отключен.", owner_id=target_id)
             await send_user_access_list(admin_id, event=ev)
-            await ev.answer("Доступ пользователя отключён и данные архивированы.", alert=True)
+            await answer_callback(ev, "Доступ пользователя отключён и данные архивированы.", alert=True)
         else:
-            await ev.answer("Не удалось отключить пользователя.", alert=True)
+            await answer_callback(ev, "Не удалось отключить пользователя.", alert=True)
         return
 
     if data == "files":
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(
             admin_id,
             "Выбери действие с файлами:",
@@ -2614,46 +2698,46 @@ async def on_cb(ev):
         return
 
     if data == "files_root":
-        await ev.answer()
+        await answer_callback(ev)
         await ev.edit("Выбери действие с файлами:", buttons=files_root_menu())
         return
 
     if data == "files_add":
-        await ev.answer()
+        await answer_callback(ev)
         await ev.edit("Выбери тип файлов для сохранения:", buttons=files_add_menu())
         return
 
     if data == "files_delete":
-        await ev.answer()
+        await answer_callback(ev)
         await ev.edit("Выбери тип файлов для удаления:", buttons=files_delete_menu())
         return
 
     if data == "files_paste":
         pending[admin_id] = {"flow": "file", "file_type": "paste", "step": "name"}
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(admin_id, "Введите название пасты:")
         return
 
     if data == "files_voice":
         pending[admin_id] = {"flow": "file", "file_type": "voice", "step": "name"}
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(admin_id, "Введите название голосового:")
         return
 
     if data == "files_video":
         pending[admin_id] = {"flow": "file", "file_type": "video", "step": "name"}
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(admin_id, "Введите название кружка:")
         return
 
     if data.startswith("files_delete_"):
         _, _, file_type = data.partition("files_delete_")
         if file_type not in FILE_TYPE_LABELS:
-            await ev.answer("Неизвестный тип", alert=True)
+            await answer_callback(ev, "Неизвестный тип", alert=True)
             return
         files = list_templates_by_type(admin_id, file_type)
         if not files:
-            await ev.answer("Файлов не найдено", alert=True)
+            await answer_callback(ev, "Файлов не найдено", alert=True)
             await ev.edit(
                 f"{FILE_TYPE_LABELS[file_type]} отсутствуют.",
                 buttons=files_delete_menu(),
@@ -2663,13 +2747,13 @@ async def on_cb(ev):
         caption = format_page_caption(
             f"{FILE_TYPE_LABELS[file_type]} для удаления", page, total_pages
         )
-        await ev.answer()
+        await answer_callback(ev)
         await ev.edit(caption, buttons=buttons)
         return
 
     if data == "add":
         pending[admin_id] = {"flow": "account", "step": "proxy_choice"}
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(
             admin_id,
             (
@@ -2686,7 +2770,7 @@ async def on_cb(ev):
         st["flow"] = "account"
         st["step"] = "proxy_manual"
         st.pop("proxy_config", None)
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(
             admin_id,
             (
@@ -2703,7 +2787,7 @@ async def on_cb(ev):
         st["flow"] = "account"
         st["step"] = "phone"
         st["proxy_config"] = {"enabled": False}
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(
             admin_id,
             "Подключение будет без прокси. Пришли номер телефона (+7XXXXXXXXXX)",
@@ -2712,16 +2796,16 @@ async def on_cb(ev):
 
     if data == "account_proxy_cancel":
         if pending.pop(admin_id, None) is not None:
-            await ev.answer("Добавление отменено", alert=True)
+            await answer_callback(ev, "Добавление отменено", alert=True)
         else:
-            await ev.answer()
+            await answer_callback(ev)
         await bot_client.send_message(admin_id, "Меню", buttons=main_menu())
         return
 
     if data == "list":
         accounts = get_accounts_meta(admin_id)
         if not accounts:
-            await ev.answer("Пусто", alert=True); await bot_client.send_message(admin_id, "Аккаунтов нет."); return
+            await answer_callback(ev, "Пусто", alert=True); await bot_client.send_message(admin_id, "Аккаунтов нет."); return
         lines = ["Аккаунты:"]
         for p, m in accounts.items():
             worker = get_worker(admin_id, p)
@@ -2751,19 +2835,19 @@ async def on_cb(ev):
             lines.append(
                 f"• {status} {p} | api:{m.get('api_id')} | dev:{m.get('device','')} | proxy:{proxy_label}{note}{note_extra}"
             )
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(admin_id, "\n".join(lines), buttons=account_control_menu())
         return
 
     if data == "back":
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(admin_id, "Главное меню", buttons=main_menu())
         return
 
     if data == "del_select":
         if not get_accounts_meta(admin_id):
-            await ev.answer("Нет аккаунтов", alert=True); return
-        await ev.answer()
+            await answer_callback(ev, "Нет аккаунтов", alert=True); return
+        await answer_callback(ev)
         buttons, page, total_pages, _ = build_account_buttons(admin_id, "del_do")
         caption = format_page_caption("Выбери аккаунт для удаления", page, total_pages)
         await bot_client.send_message(admin_id, caption, buttons=buttons)
@@ -2771,8 +2855,8 @@ async def on_cb(ev):
 
     if data == "val_select":
         if not get_accounts_meta(admin_id):
-            await ev.answer("Нет аккаунтов", alert=True); return
-        await ev.answer()
+            await answer_callback(ev, "Нет аккаунтов", alert=True); return
+        await answer_callback(ev)
         buttons, page, total_pages, _ = build_account_buttons(admin_id, "val_do")
         caption = format_page_caption("Выбери аккаунт для проверки", page, total_pages)
         await bot_client.send_message(admin_id, caption, buttons=buttons)
@@ -2782,18 +2866,18 @@ async def on_cb(ev):
         try:
             _, prefix, page_str = data.split(":", 2)
         except ValueError:
-            await ev.answer("Некорректные данные", alert=True)
+            await answer_callback(ev, "Некорректные данные", alert=True)
             return
         try:
             page = int(page_str)
         except ValueError:
-            await ev.answer("Некорректная страница", alert=True)
+            await answer_callback(ev, "Некорректная страница", alert=True)
             return
         buttons, current_page, total_pages, total_count = build_account_buttons(
             admin_id, prefix, page
         )
         if total_count == 0:
-            await ev.answer("Нет аккаунтов", alert=True)
+            await answer_callback(ev, "Нет аккаунтов", alert=True)
             await ev.edit("Аккаунтов нет.", buttons=None)
             return
         if prefix == "del_do":
@@ -2802,7 +2886,7 @@ async def on_cb(ev):
             caption = format_page_caption("Выбери аккаунт для проверки", current_page, total_pages)
         else:
             caption = format_page_caption("Выберите аккаунт", current_page, total_pages)
-        await ev.answer()
+        await answer_callback(ev)
         await ev.edit(caption, buttons=buttons)
         return
 
@@ -2810,19 +2894,19 @@ async def on_cb(ev):
         try:
             _, file_type, page_str = data.split(":", 2)
         except ValueError:
-            await ev.answer("Некорректные данные", alert=True)
+            await answer_callback(ev, "Некорректные данные", alert=True)
             return
         if file_type not in FILE_TYPE_LABELS:
-            await ev.answer("Неизвестный тип", alert=True)
+            await answer_callback(ev, "Неизвестный тип", alert=True)
             return
         try:
             page = int(page_str)
         except ValueError:
-            await ev.answer("Некорректная страница", alert=True)
+            await answer_callback(ev, "Некорректная страница", alert=True)
             return
         files = list_templates_by_type(admin_id, file_type)
         if not files:
-            await ev.answer("Файлы отсутствуют", alert=True)
+            await answer_callback(ev, "Файлы отсутствуют", alert=True)
             await ev.edit(
                 f"{FILE_TYPE_LABELS[file_type]} отсутствуют.",
                 buttons=files_delete_menu(),
@@ -2834,7 +2918,7 @@ async def on_cb(ev):
         caption = format_page_caption(
             f"{FILE_TYPE_LABELS[file_type]} для удаления", current_page, total_pages
         )
-        await ev.answer()
+        await answer_callback(ev)
         await ev.edit(caption, buttons=buttons)
         return
 
@@ -2842,10 +2926,10 @@ async def on_cb(ev):
         try:
             _, file_type, page_str, encoded = data.split(":", 3)
         except ValueError:
-            await ev.answer("Некорректные данные", alert=True)
+            await answer_callback(ev, "Некорректные данные", alert=True)
             return
         if file_type not in FILE_TYPE_LABELS:
-            await ev.answer("Неизвестный тип", alert=True)
+            await answer_callback(ev, "Неизвестный тип", alert=True)
             return
         try:
             page = int(page_str)
@@ -2856,7 +2940,7 @@ async def on_cb(ev):
             try:
                 path = _decode_payload(encoded)
             except Exception:
-                await ev.answer("Некорректные данные", alert=True)
+                await answer_callback(ev, "Некорректные данные", alert=True)
                 return
         abs_path = os.path.abspath(path)
         allowed_dirs = [
@@ -2865,14 +2949,14 @@ async def on_cb(ev):
             if d
         ]
         if not any(_is_path_within(abs_path, base) for base in allowed_dirs):
-            await ev.answer("Удаление запрещено", alert=True)
+            await answer_callback(ev, "Удаление запрещено", alert=True)
             return
         try:
             os.remove(abs_path)
         except FileNotFoundError:
             pass
         except OSError as e:
-            await ev.answer(f"Не удалось удалить файл: {e}", alert=True)
+            await answer_callback(ev, f"Не удалось удалить файл: {e}", alert=True)
             return
         files = list_templates_by_type(admin_id, file_type)
         if not files:
@@ -2880,7 +2964,7 @@ async def on_cb(ev):
                 f"{FILE_TYPE_LABELS[file_type]} отсутствуют.",
                 buttons=files_delete_menu(),
             )
-            await ev.answer("Файл удалён")
+            await answer_callback(ev, "Файл удалён")
             return
         buttons, current_page, total_pages, _ = build_file_delete_keyboard(
             files, file_type, page
@@ -2889,13 +2973,13 @@ async def on_cb(ev):
             f"{FILE_TYPE_LABELS[file_type]} для удаления", current_page, total_pages
         )
         await ev.edit(caption, buttons=buttons)
-        await ev.answer("Файл удалён")
+        await answer_callback(ev, "Файл удалён")
         return
 
     if data.startswith("del_do:"):
         phone = data.split(":", 1)[1]
         worker = get_worker(admin_id, phone)
-        await ev.answer()
+        await answer_callback(ev)
         if worker:
             await worker.logout()
             unregister_worker(admin_id, phone)
@@ -2916,10 +3000,10 @@ async def on_cb(ev):
 
     if data.startswith("val_do:"):
         phone = data.split(":", 1)[1]
-        worker = get_worker(admin_id, phone)
-        await ev.answer()
+        await answer_callback(ev)
         meta = get_account_meta(admin_id, phone) or {}
         state = meta.get("state")
+        worker = await ensure_worker_running(admin_id, phone)
         if not worker:
             if state == "banned":
                 await bot_client.send_message(
@@ -2959,25 +3043,25 @@ async def on_cb(ev):
         ctx = data.split(":", 1)[1]
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
+            await answer_callback(ev, "Контекст истёк", alert=True)
             return
         await mark_dialog_read_for_context(ctx_info)
-        await ev.answer("Диалог помечен прочитанным")
+        await answer_callback(ev, "Диалог помечен прочитанным")
         return
 
     if data.startswith("reply:") or data.startswith("reply_to:"):
         ctx = data.split(":", 1)[1]
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
+            await answer_callback(ev, "Контекст истёк", alert=True)
             return
         await mark_dialog_read_for_context(ctx_info)
         if reply_waiting.get(admin_id):
-            await ev.answer("Уже жду сообщение", alert=True)
+            await answer_callback(ev, "Уже жду сообщение", alert=True)
             return
         mode = "reply" if data.startswith("reply_to:") else "normal"
         reply_waiting[admin_id] = {"ctx": ctx, "mode": mode}
-        await ev.answer()
+        await answer_callback(ev)
         await show_interactive_message(
             admin_id,
             build_reply_prompt(ctx_info, mode),
@@ -2988,19 +3072,19 @@ async def on_cb(ev):
     if data.startswith("reply_reaction_menu:"):
         parts = data.split(":", 2)
         if len(parts) != 3:
-            await ev.answer("Некорректные данные", alert=True)
+            await answer_callback(ev, "Некорректные данные", alert=True)
             return
         _, ctx, mode = parts
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
-            return\
+            await answer_callback(ev, "Контекст истёк", alert=True)
+            return
         await mark_dialog_read_for_context(ctx_info)
         if mode != "reply":
-            await ev.answer("Реакции доступны только для реплая", alert=True)
+            await answer_callback(ev, "Реакции доступны только для реплая", alert=True)
             return
         reply_waiting[admin_id] = {"ctx": ctx, "mode": mode}
-        await ev.answer()
+        await answer_callback(ev)
         await show_interactive_message(
             admin_id,
             "Выбери реакцию для сообщения:",
@@ -3012,16 +3096,16 @@ async def on_cb(ev):
     if data.startswith("reply_reaction_back:"):
         parts = data.split(":", 2)
         if len(parts) != 3:
-            await ev.answer("Некорректные данные", alert=True)
+            await answer_callback(ev, "Некорректные данные", alert=True)
             return
         _, ctx, mode = parts
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
+            await answer_callback(ev, "Контекст истёк", alert=True)
             return
         await mark_dialog_read_for_context(ctx_info)
         reply_waiting[admin_id] = {"ctx": ctx, "mode": mode}
-        await ev.answer()
+        await answer_callback(ev)
         await show_interactive_message(
             admin_id,
             build_reply_prompt(ctx_info, mode),
@@ -3033,32 +3117,32 @@ async def on_cb(ev):
     if data.startswith("reply_reaction:"):
         parts = data.split(":", 3)
         if len(parts) != 4:
-            await ev.answer("Некорректные данные", alert=True)
+            await answer_callback(ev, "Некорректные данные", alert=True)
             return
         _, ctx, mode, encoded = parts
         if mode != "reply":
-            await ev.answer("Реакции доступны только для реплая", alert=True)
+            await answer_callback(ev, "Реакции доступны только для реплая", alert=True)
             return
         try:
             emoji = _decode_payload(encoded)
         except Exception:
-            await ev.answer("Некорректная реакция", alert=True)
+            await answer_callback(ev, "Некорректная реакция", alert=True)
             return
         if emoji not in REACTION_EMOJI_SET:
-            await ev.answer("Реакция не поддерживается", alert=True)
+            await answer_callback(ev, "Реакция не поддерживается", alert=True)
             return
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
+            await answer_callback(ev, "Контекст истёк", alert=True)
             return
         await mark_dialog_read_for_context(ctx_info)
         msg_id = ctx_info.get("msg_id")
         if msg_id is None:
-            await ev.answer("Сообщение недоступно", alert=True)
+            await answer_callback(ev, "Сообщение недоступно", alert=True)
             return
         worker = get_worker(admin_id, ctx_info["phone"])
         if not worker:
-            await ev.answer("Аккаунт недоступен", alert=True)
+            await answer_callback(ev, "Аккаунт недоступен", alert=True)
             return
         try:
             await worker.send_reaction(
@@ -3068,10 +3152,10 @@ async def on_cb(ev):
                 msg_id=msg_id,
             )
         except Exception as e:
-            await ev.answer(f"Ошибка реакции: {e}", alert=True)
+            await answer_callback(ev, f"Ошибка реакции: {e}", alert=True)
             return
         reply_waiting[admin_id] = {"ctx": ctx, "mode": mode}
-        await ev.answer("Реакция отправлена")
+        await answer_callback(ev, "Реакция отправлена")
         await bot_client.send_message(
             admin_id,
             f"✅ Реакция {emoji} добавлена к сообщению собеседника.",
@@ -3083,7 +3167,7 @@ async def on_cb(ev):
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if ctx_info:
             await mark_dialog_read_for_context(ctx_info)
-        await ev.answer()
+        await answer_callback(ev)
         await bot_client.send_message(admin_id, "❌ Ответ отменён.")
         return
 
@@ -3091,14 +3175,14 @@ async def on_cb(ev):
         ctx = data.split(":", 1)[1]
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
+            await answer_callback(ev, "Контекст истёк", alert=True)
             return
         await mark_dialog_read_for_context(ctx_info)
         worker = get_worker(admin_id, ctx_info["phone"])
         if not worker:
-            await ev.answer("Аккаунт недоступен", alert=True)
+            await answer_callback(ev, "Аккаунт недоступен", alert=True)
             return
-        await ev.answer()
+        await answer_callback(ev)
         try:
             await worker.block_contact(ctx_info["chat_id"], ctx_info.get("peer"))
         except Exception as e:
@@ -3114,16 +3198,15 @@ async def on_cb(ev):
             )
         return
 
-
     if data.startswith(("reply_paste_menu:", "reply_voice_menu:", "reply_video_menu:")):
         parts = data.split(":", 2)
         if len(parts) != 3:
-            await ev.answer("Некорректные данные", alert=True)
+            await answer_callback(ev, "Некорректные данные", alert=True)
             return
         _, ctx, mode = parts
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
+            await answer_callback(ev, "Контекст истёк", alert=True)
             return
         await mark_dialog_read_for_context(ctx_info)
         owner_for_ctx = ctx_info["owner_id"]
@@ -3143,9 +3226,9 @@ async def on_cb(ev):
             title = "📹 Выбери кружок для отправки:"
             prefix = "video_send"
         if not files:
-            await ev.answer(empty_text, alert=True)
+            await answer_callback(ev, empty_text, alert=True)
             return
-        await ev.answer()
+        await answer_callback(ev)
         await show_interactive_message(
             admin_id,
             title,
@@ -3153,11 +3236,11 @@ async def on_cb(ev):
             replace=True,
         )
         return
-    
+
     if data.startswith("paste_send:"):
         parts = data.split(":")
         if len(parts) not in (3, 4):
-            await ev.answer("Некорректные данные", alert=True)
+            await answer_callback(ev, "Некорректные данные", alert=True)
             return
         if len(parts) == 3:
             _, ctx, idx_str = parts
@@ -3168,31 +3251,31 @@ async def on_cb(ev):
                 mode = "normal"
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
+            await answer_callback(ev, "Контекст истёк", alert=True)
             return
         await mark_dialog_read_for_context(ctx_info)
         try:
             idx = int(idx_str)
         except ValueError:
-            await ev.answer("Некорректный выбор", alert=True)
+            await answer_callback(ev, "Некорректный выбор", alert=True)
             return
         files = list_text_templates(admin_id)
         if idx < 0 or idx >= len(files):
-            await ev.answer("Файл не найден", alert=True)
+            await answer_callback(ev, "Файл не найден", alert=True)
             return
         file_path = files[idx]
         try:
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read().strip()
         except Exception as e:
-            await ev.answer(f"Ошибка чтения: {e}", alert=True)
+            await answer_callback(ev, f"Ошибка чтения: {e}", alert=True)
             return
         if not content:
-            await ev.answer("Файл пуст", alert=True)
+            await answer_callback(ev, "Файл пуст", alert=True)
             return
         worker = get_worker(admin_id, ctx_info["phone"])
         if not worker:
-            await ev.answer("Аккаунт недоступен", alert=True)
+            await answer_callback(ev, "Аккаунт недоступен", alert=True)
             return
         reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
         try:
@@ -3204,16 +3287,16 @@ async def on_cb(ev):
                 mark_read_msg_id=ctx_info.get("msg_id"),
             )
         except Exception as e:
-            await ev.answer(f"Ошибка отправки: {e}", alert=True)
+            await answer_callback(ev, f"Ошибка отправки: {e}", alert=True)
             return
-        await ev.answer("✅ Паста отправлена")
+        await answer_callback(ev, "✅ Паста отправлена")
         await bot_client.send_message(admin_id, "✅ Паста отправлена собеседнику.")
         return
 
     if data.startswith("voice_send:"):
         parts = data.split(":")
         if len(parts) not in (3, 4):
-            await ev.answer("Некорректные данные", alert=True)
+            await answer_callback(ev, "Некорректные данные", alert=True)
             return
         if len(parts) == 3:
             _, ctx, idx_str = parts
@@ -3224,22 +3307,22 @@ async def on_cb(ev):
                 mode = "normal"
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
+            await answer_callback(ev, "Контекст истёк", alert=True)
             return
         await mark_dialog_read_for_context(ctx_info)
         try:
             idx = int(idx_str)
         except ValueError:
-            await ev.answer("Некорректный выбор", alert=True)
+            await answer_callback(ev, "Некорректный выбор", alert=True)
             return
         files = list_voice_templates(admin_id)
         if idx < 0 or idx >= len(files):
-            await ev.answer("Файл не найден", alert=True)
+            await answer_callback(ev, "Файл не найден", alert=True)
             return
         file_path = files[idx]
         worker = get_worker(admin_id, ctx_info["phone"])
         if not worker:
-            await ev.answer("Аккаунт недоступен", alert=True)
+            await answer_callback(ev, "Аккаунт недоступен", alert=True)
             return
         reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
         try:
@@ -3251,16 +3334,16 @@ async def on_cb(ev):
                 mark_read_msg_id=ctx_info.get("msg_id"),
             )
         except Exception as e:
-            await ev.answer(f"Ошибка отправки: {e}", alert=True)
+            await answer_callback(ev, f"Ошибка отправки: {e}", alert=True)
             return
-        await ev.answer("✅ Голосовое отправлено")
+        await answer_callback(ev, "✅ Голосовое отправлено")
         await bot_client.send_message(admin_id, "✅ Голосовое сообщение отправлено собеседнику.")
         return
 
     if data.startswith("video_send:"):
         parts = data.split(":")
         if len(parts) not in (3, 4):
-            await ev.answer("Некорректные данные", alert=True)
+            await answer_callback(ev, "Некорректные данные", alert=True)
             return
         if len(parts) == 3:
             _, ctx, idx_str = parts
@@ -3271,22 +3354,22 @@ async def on_cb(ev):
                 mode = "normal"
         ctx_info = get_reply_context_for_admin(ctx, admin_id)
         if not ctx_info:
-            await ev.answer("Контекст истёк", alert=True)
+            await answer_callback(ev, "Контекст истёк", alert=True)
             return
         await mark_dialog_read_for_context(ctx_info)
         try:
             idx = int(idx_str)
         except ValueError:
-            await ev.answer("Некорректный выбор", alert=True)
+            await answer_callback(ev, "Некорректный выбор", alert=True)
             return
         files = list_video_templates(admin_id)
         if idx < 0 or idx >= len(files):
-            await ev.answer("Файл не найден", alert=True)
+            await answer_callback(ev, "Файл не найден", alert=True)
             return
         file_path = files[idx]
         worker = get_worker(admin_id, ctx_info["phone"])
         if not worker:
-            await ev.answer("Аккаунт недоступен", alert=True)
+            await answer_callback(ev, "Аккаунт недоступен", alert=True)
             return
         reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
         try:
@@ -3298,19 +3381,20 @@ async def on_cb(ev):
                 mark_read_msg_id=ctx_info.get("msg_id"),
             )
         except Exception as e:
-            await ev.answer(f"Ошибка отправки: {e}", alert=True)
+            await answer_callback(ev, f"Ошибка отправки: {e}", alert=True)
             return
-        await ev.answer("✅ Кружок отправлен")
+        await answer_callback(ev, "✅ Кружок отправлен")
         await bot_client.send_message(admin_id, "✅ Кружок отправлен собеседнику.")
         return
     if data == "asset_close":
-        await ev.answer()
+        await answer_callback(ev)
         return
 
     if data == "ping":
-        await ev.answer(); await bot_client.send_message(admin_id, "✅ OK", buttons=main_menu()); return
+        await answer_callback(ev); await bot_client.send_message(admin_id, "✅ OK", buttons=main_menu()); return
 
 @bot_client.on(events.NewMessage)
+
 async def on_text(ev):
     admin_id = _extract_event_user_id(ev)
     if admin_id is None or not is_admin(admin_id):
