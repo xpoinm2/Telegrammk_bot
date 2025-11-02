@@ -1572,6 +1572,7 @@ class AccountWorker:
         message: str,
         peer: Optional[Any] = None,
         reply_to_msg_id: Optional[int] = None,
+        mark_read_msg_id: Optional[int] = None,
     ):
         client = await self._ensure_client()
         if not await client.is_user_authorized():
@@ -1584,6 +1585,9 @@ class AccountWorker:
         await self._simulate_typing(client, peer, message)
         try:
             await client.send_message(peer, message, reply_to=reply_to_msg_id)
+            if mark_read_msg_id is not None:
+                with contextlib.suppress(Exception):
+                    await client.send_read_acknowledge(peer, max_id=mark_read_msg_id)
         except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
             await self._handle_account_disabled("banned", e)
             raise RuntimeError("Аккаунт заблокирован Telegram")
@@ -1597,6 +1601,7 @@ class AccountWorker:
         file_path: str,
         peer: Optional[Any] = None,
         reply_to_msg_id: Optional[int] = None,
+        mark_read_msg_id: Optional[int] = None,
     ):
         client = await self._ensure_client()
         if not await client.is_user_authorized():
@@ -1614,6 +1619,9 @@ class AccountWorker:
                 voice_note=True,
                 reply_to=reply_to_msg_id,
             )
+            if mark_read_msg_id is not None:
+                with contextlib.suppress(Exception):
+                    await client.send_read_acknowledge(peer, max_id=mark_read_msg_id)
         except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
             await self._handle_account_disabled("banned", e)
             raise RuntimeError("Аккаунт заблокирован Telegram")
@@ -1627,6 +1635,7 @@ class AccountWorker:
         file_path: str,
         peer: Optional[Any] = None,
         reply_to_msg_id: Optional[int] = None,
+        mark_read_msg_id: Optional[int] = None,
     ):
         client = await self._ensure_client()
         if not await client.is_user_authorized():
@@ -1644,6 +1653,9 @@ class AccountWorker:
                 video_note=True,
                 reply_to=reply_to_msg_id,
             )
+            if mark_read_msg_id is not None:
+                with contextlib.suppress(Exception):
+                    await client.send_read_acknowledge(peer, max_id=mark_read_msg_id)
         except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
             await self._handle_account_disabled("banned", e)
             raise RuntimeError("Аккаунт заблокирован Telegram")
@@ -2724,6 +2736,7 @@ async def on_cb(ev):
                 content,
                 ctx_info.get("peer"),
                 reply_to_msg_id=reply_to_msg_id,
+                mark_read_msg_id=ctx_info.get("msg_id"),
             )
         except Exception as e:
             await ev.answer(f"Ошибка отправки: {e}", alert=True)
@@ -2769,6 +2782,7 @@ async def on_cb(ev):
                 file_path,
                 ctx_info.get("peer"),
                 reply_to_msg_id=reply_to_msg_id,
+                mark_read_msg_id=ctx_info.get("msg_id"),
             )
         except Exception as e:
             await ev.answer(f"Ошибка отправки: {e}", alert=True)
@@ -2814,6 +2828,7 @@ async def on_cb(ev):
                 file_path,
                 ctx_info.get("peer"),
                 reply_to_msg_id=reply_to_msg_id,
+                mark_read_msg_id=ctx_info.get("msg_id"),
             )
         except Exception as e:
             await ev.answer(f"Ошибка отправки: {e}", alert=True)
@@ -2916,6 +2931,7 @@ async def on_text(ev):
                 text,
                 ctx.get("peer"),
                 reply_to_msg_id=reply_to_msg_id,
+                mark_read_msg_id=ctx.get("msg_id"),
             )
             await ev.reply("✅ Сообщение отправлено.")
         except Exception as e:
