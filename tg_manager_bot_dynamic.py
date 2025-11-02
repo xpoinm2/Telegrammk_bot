@@ -30,6 +30,7 @@ try:  # Telethon <= 1.33.1
 except ImportError:  # Telethon >= 1.34 moved/renamed the error
     from telethon.errors.rpcerrorlist import QueryIdInvalidError  # type: ignore[attr-defined]
 from telethon.tl.types import ReactionEmoji
+from telethon.tl.custom import Message
 try:  # Telethon <= 1.33.1
     from telethon.errors import AuthKeyDuplicatedError  # type: ignore[attr-defined]
 except ImportError:  # Telethon >= 1.34
@@ -1895,7 +1896,7 @@ class AccountWorker:
                 peer = chat_id
         await self._simulate_typing(client, peer, message)
         try:
-            await client.send_message(peer, message, reply_to=reply_to_msg_id)
+            sent = await client.send_message(peer, message, reply_to=reply_to_msg_id)
             if mark_read_msg_id is not None:
                 with contextlib.suppress(Exception):
                     await client.send_read_acknowledge(peer, max_id=mark_read_msg_id)
@@ -1905,6 +1906,7 @@ class AccountWorker:
         except UserDeactivatedError as e:
             await self._handle_account_disabled("frozen", e)
             raise RuntimeError("Аккаунт заморожен Telegram")
+        return sent
 
     async def send_voice(
         self,
@@ -1924,7 +1926,7 @@ class AccountWorker:
                 peer = chat_id
         await self._simulate_voice_recording(client, peer, file_path)
         try:
-            await client.send_file(
+            sent = await client.send_file(
                 peer,
                 file_path,
                 voice_note=True,
@@ -1939,6 +1941,7 @@ class AccountWorker:
         except UserDeactivatedError as e:
             await self._handle_account_disabled("frozen", e)
             raise RuntimeError("Аккаунт заморожен Telegram")
+        return sent
         
     async def send_video_note(
         self,
@@ -1958,7 +1961,7 @@ class AccountWorker:
                 peer = chat_id
         await self._simulate_round_recording(client, peer, file_path)
         try:
-            await client.send_file(
+            sent = await client.send_file(
                 peer,
                 file_path,
                 video_note=True,
@@ -1967,6 +1970,54 @@ class AccountWorker:
             if mark_read_msg_id is not None:
                 with contextlib.suppress(Exception):
                     await client.send_read_acknowledge(peer, max_id=mark_read_msg_id)
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise RuntimeError("Аккаунт заблокирован Telegram")
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise RuntimeError("Аккаунт заморожен Telegram")
+        return sent
+
+    async def edit_message(
+        self,
+        chat_id: int,
+        msg_id: int,
+        new_text: str,
+        peer: Optional[Any] = None,
+    ):
+        client = await self._ensure_client()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Аккаунт не авторизован")
+        if peer is None:
+            try:
+                peer = await client.get_input_entity(chat_id)
+            except Exception:
+                peer = chat_id
+        try:
+            await client.edit_message(peer, msg_id, new_text)
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise RuntimeError("Аккаунт заблокирован Telegram")
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise RuntimeError("Аккаунт заморожен Telegram")
+
+    async def delete_message(
+        self,
+        chat_id: int,
+        msg_id: int,
+        peer: Optional[Any] = None,
+    ):
+        client = await self._ensure_client()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Аккаунт не авторизован")
+        if peer is None:
+            try:
+                peer = await client.get_input_entity(chat_id)
+            except Exception:
+                peer = chat_id
+        try:
+            await client.delete_messages(peer, [msg_id], revoke=True)
         except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
             await self._handle_account_disabled("banned", e)
             raise RuntimeError("Аккаунт заблокирован Telegram")
@@ -2127,6 +2178,55 @@ pending: Dict[int, Dict[str, Any]] = {}
 WORKERS: Dict[int, Dict[str, AccountWorker]] = {}
 reply_contexts: Dict[str, Dict[str, Any]] = {}
 reply_waiting: Dict[int, Dict[str, Any]] = {}
+edit_waiting: Dict[int, Dict[str, Any]] = {}
+outgoing_actions: Dict[str, Dict[str, Any]] = {}
+
+
+def _extract_message_id(sent: Any) -> Optional[int]:
+    if sent is None:
+        return None
+    if isinstance(sent, Message):
+        return sent.id
+    if isinstance(sent, (list, tuple, set)):
+        for item in sent:
+            msg_id = _extract_message_id(item)
+            if msg_id is not None:
+                return msg_id
+    msg_id = getattr(sent, "id", None)
+    if isinstance(msg_id, int):
+        return msg_id
+    return None
+
+
+def register_outgoing_action(
+    admin_id: int,
+    *,
+    phone: str,
+    chat_id: int,
+    peer: Optional[Any],
+    msg_id: Optional[int],
+    message_type: str,
+) -> Optional[str]:
+    if msg_id is None:
+        return None
+    token = secrets.token_urlsafe(8)
+    outgoing_actions[token] = {
+        "admin_id": admin_id,
+        "phone": phone,
+        "chat_id": chat_id,
+        "peer": peer,
+        "msg_id": msg_id,
+        "type": message_type,
+    }
+    return token
+
+
+def build_outgoing_control_buttons(token: str, *, allow_edit: bool) -> List[List[Button]]:
+    buttons: List[Button] = []
+    if allow_edit:
+        buttons.append(Button.inline("✏️ Исправить", f"out_edit:{token}".encode()))
+    buttons.append(Button.inline("🗑 Стереть", f"out_delete:{token}".encode()))
+    return [buttons]
 
 
 async def apply_proxy_config_to_owner(owner_id: int, *, restart_active: bool = True) -> Tuple[int, List[str]]:
@@ -2415,6 +2515,8 @@ async def cancel_operations(admin_id: int, notify: bool = True) -> bool:
     if reply_waiting.pop(admin_id, None) is not None:
         cancelled = True
     if pending.pop(admin_id, None) is not None:
+        cancelled = True
+    if edit_waiting.pop(admin_id, None) is not None:
         cancelled = True
     if cancelled and notify:
         await bot_client.send_message(admin_id, "❌ Текущая операция отменена.")
@@ -3279,7 +3381,7 @@ async def on_cb(ev):
             return
         reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
         try:
-            await worker.send_outgoing(
+            sent = await worker.send_outgoing(
                 ctx_info["chat_id"],
                 content,
                 ctx_info.get("peer"),
@@ -3289,8 +3391,23 @@ async def on_cb(ev):
         except Exception as e:
             await answer_callback(ev, f"Ошибка отправки: {e}", alert=True)
             return
+        token = register_outgoing_action(
+            admin_id,
+            phone=ctx_info["phone"],
+            chat_id=ctx_info["chat_id"],
+            peer=ctx_info.get("peer"),
+            msg_id=_extract_message_id(sent),
+            message_type="text",
+        )
+        buttons = (
+            build_outgoing_control_buttons(token, allow_edit=True) if token else None
+        )
         await answer_callback(ev, "✅ Паста отправлена")
-        await bot_client.send_message(admin_id, "✅ Паста отправлена собеседнику.")
+        await bot_client.send_message(
+            admin_id,
+            "✅ Паста отправлена собеседнику.",
+            buttons=buttons,
+        )
         return
 
     if data.startswith("voice_send:"):
@@ -3326,7 +3443,7 @@ async def on_cb(ev):
             return
         reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
         try:
-            await worker.send_voice(
+            sent = await worker.send_voice(
                 ctx_info["chat_id"],
                 file_path,
                 ctx_info.get("peer"),
@@ -3337,7 +3454,22 @@ async def on_cb(ev):
             await answer_callback(ev, f"Ошибка отправки: {e}", alert=True)
             return
         await answer_callback(ev, "✅ Голосовое отправлено")
-        await bot_client.send_message(admin_id, "✅ Голосовое сообщение отправлено собеседнику.")
+        token = register_outgoing_action(
+            admin_id,
+            phone=ctx_info["phone"],
+            chat_id=ctx_info["chat_id"],
+            peer=ctx_info.get("peer"),
+            msg_id=_extract_message_id(sent),
+            message_type="voice",
+        )
+        buttons = (
+            build_outgoing_control_buttons(token, allow_edit=False) if token else None
+        )
+        await bot_client.send_message(
+            admin_id,
+            "✅ Голосовое сообщение отправлено собеседнику.",
+            buttons=buttons,
+        )
         return
 
     if data.startswith("video_send:"):
@@ -3373,7 +3505,7 @@ async def on_cb(ev):
             return
         reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
         try:
-            await worker.send_video_note(
+            sent = await worker.send_video_note(
                 ctx_info["chat_id"],
                 file_path,
                 ctx_info.get("peer"),
@@ -3384,7 +3516,66 @@ async def on_cb(ev):
             await answer_callback(ev, f"Ошибка отправки: {e}", alert=True)
             return
         await answer_callback(ev, "✅ Кружок отправлен")
-        await bot_client.send_message(admin_id, "✅ Кружок отправлен собеседнику.")
+        token = register_outgoing_action(
+            admin_id,
+            phone=ctx_info["phone"],
+            chat_id=ctx_info["chat_id"],
+            peer=ctx_info.get("peer"),
+            msg_id=_extract_message_id(sent),
+            message_type="video",
+        )
+        buttons = (
+            build_outgoing_control_buttons(token, allow_edit=False) if token else None
+        )
+        await bot_client.send_message(
+            admin_id,
+            "✅ Кружок отправлен собеседнику.",
+            buttons=buttons,
+        )
+        return
+    if data.startswith("out_edit:"):
+        token = data.split(":", 1)[1]
+        info = outgoing_actions.get(token)
+        if not info or info.get("admin_id") != admin_id:
+            await answer_callback(ev, "Контекст недоступен", alert=True)
+            return
+        if info.get("type") != "text":
+            await answer_callback(ev, "Сообщение нельзя исправить", alert=True)
+            return
+        edit_waiting[admin_id] = {"token": token}
+        await answer_callback(ev)
+        await bot_client.send_message(
+            admin_id,
+            "✏️ Пришли исправленный текст. Для отмены нажми MENU.",
+        )
+        return
+    if data.startswith("out_delete:"):
+        token = data.split(":", 1)[1]
+        info = outgoing_actions.get(token)
+        if not info or info.get("admin_id") != admin_id:
+            await answer_callback(ev, "Контекст недоступен", alert=True)
+            return
+        worker = get_worker(admin_id, info.get("phone")) if info.get("phone") else None
+        if not worker:
+            await answer_callback(ev, "Аккаунт недоступен", alert=True)
+            return
+        try:
+            await worker.delete_message(
+                info["chat_id"],
+                info["msg_id"],
+                info.get("peer"),
+            )
+        except Exception as e:
+            await answer_callback(ev, f"Ошибка удаления: {e}", alert=True)
+            return
+        outgoing_actions.pop(token, None)
+        if edit_waiting.get(admin_id, {}).get("token") == token:
+            edit_waiting.pop(admin_id, None)
+        await answer_callback(ev, "Сообщение стерто")
+        await bot_client.send_message(
+            admin_id,
+            "🗑 Сообщение стерто для обеих сторон.",
+        )
         return
     if data == "asset_close":
         await answer_callback(ev)
@@ -3460,6 +3651,33 @@ async def on_text(ev):
             await ev.respond("Неизвестная команда. Используй меню.")
         return
 
+    edit_ctx = edit_waiting.get(admin_id)
+    if edit_ctx:
+        if not text:
+            await ev.reply("Пустое сообщение. Пришли текст для исправления.")
+            return
+        edit_waiting.pop(admin_id, None)
+        token = edit_ctx.get("token")
+        info = outgoing_actions.get(token) if token else None
+        if not info or info.get("admin_id") != admin_id:
+            await ev.reply("Контекст редактирования устарел.")
+            return
+        worker = get_worker(admin_id, info.get("phone")) if info.get("phone") else None
+        if not worker:
+            await ev.reply("Аккаунт недоступен.")
+            return
+        try:
+            await worker.edit_message(
+                info["chat_id"],
+                info["msg_id"],
+                text,
+                info.get("peer"),
+            )
+            await ev.reply("✅ Сообщение исправлено.")
+        except Exception as e:
+            await ev.reply(f"Ошибка редактирования: {e}")
+        return
+
     waiting = reply_waiting.get(admin_id)
     if waiting:
         if not text:
@@ -3477,14 +3695,27 @@ async def on_text(ev):
             return
         reply_to_msg_id = ctx.get("msg_id") if waiting.get("mode") == "reply" else None
         try:
-            await worker.send_outgoing(
+            sent = await worker.send_outgoing(
                 ctx["chat_id"],
                 text,
                 ctx.get("peer"),
                 reply_to_msg_id=reply_to_msg_id,
                 mark_read_msg_id=ctx.get("msg_id"),
             )
-            await ev.reply("✅ Сообщение отправлено.")
+            token = register_outgoing_action(
+                admin_id,
+                phone=ctx["phone"],
+                chat_id=ctx["chat_id"],
+                peer=ctx.get("peer"),
+                msg_id=_extract_message_id(sent),
+                message_type="text",
+            )
+            buttons = (
+                build_outgoing_control_buttons(token, allow_edit=True)
+                if token
+                else None
+            )
+            await ev.reply("✅ Сообщение отправлено.", buttons=buttons)
         except Exception as e:
             await ev.reply(f"Ошибка отправки: {e}")
         return
