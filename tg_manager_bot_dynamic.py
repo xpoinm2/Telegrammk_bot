@@ -25,6 +25,7 @@ from telethon.errors import (
     FloodWaitError,
     PeerIdInvalidError,
 )
+from telethon.tl.types import ReactionEmoji
 try:  # Telethon <= 1.33.1
     from telethon.errors import AuthKeyDuplicatedError  # type: ignore[attr-defined]
 except ImportError:  # Telethon >= 1.34
@@ -168,6 +169,14 @@ ACCOUNTS_META = "accounts.json"
 ROTATION_STATE = ".rotation_state.json"
 TENANTS_DB = "tenants.json"
 MAX_MEDIA_FORWARD_SIZE = 20 * 1024 * 1024  # 20 MB
+
+REACTION_CHOICES: List[Tuple[str, str]] = [
+    ("😂 Смех", "😂"),
+    ("🔥 Огонь", "🔥"),
+    ("❤️ Сердечко", "❤️"),
+    ("😮 Удивление", "😮"),
+]
+REACTION_EMOJI_SET: Set[str] = {emoji for _, emoji in REACTION_CHOICES}
 
 
 def _ensure_dict(value: Any) -> Dict[str, Any]:
@@ -790,8 +799,17 @@ def build_asset_keyboard(
     return rows
 
 
+def build_reply_prompt(ctx_info: Dict[str, Any], mode: str) -> str:
+    hint_suffix = " (будет отправлено как reply)." if mode == "reply" else "."
+    return (
+        f"Ответ для {ctx_info['phone']} (chat_id {ctx_info['chat_id']}): "
+        f"пришли текст сообщения{hint_suffix}\n"
+        "Или выбери шаблон ниже."
+    )
+
+
 def build_reply_options_keyboard(ctx: str, mode: str) -> List[List[Button]]:
-    return [
+    rows: List[List[Button]] = [
         [
             Button.inline("📄 Пасты", f"reply_paste_menu:{ctx}:{mode}".encode()),
             Button.inline("🎙 Голосовые", f"reply_voice_menu:{ctx}:{mode}".encode()),
@@ -799,8 +817,22 @@ def build_reply_options_keyboard(ctx: str, mode: str) -> List[List[Button]]:
         [
             Button.inline("📹 Кружки", f"reply_video_menu:{ctx}:{mode}".encode()),
         ],
-        [Button.inline("❌ Отмена", f"reply_cancel:{ctx}".encode())],
     ]
+    if mode == "reply":
+        rows.append([Button.inline("💬 Реакция", f"reply_reaction_menu:{ctx}:{mode}".encode())])
+    rows.append([Button.inline("❌ Отмена", f"reply_cancel:{ctx}".encode())])
+    return rows
+
+
+def build_reaction_keyboard(ctx: str, mode: str) -> List[List[Button]]:
+    rows: List[List[Button]] = []
+    for title, emoji in REACTION_CHOICES:
+        encoded = _encode_payload(emoji)
+        rows.append(
+            [Button.inline(f"{emoji} {title}", f"reply_reaction:{ctx}:{mode}:{encoded}".encode())]
+        )
+    rows.append([Button.inline("⬅️ Назад", f"reply_reaction_back:{ctx}:{mode}".encode())])
+    return rows
 
 def next_index(owner_id: int, key: str, length: int) -> int:
     rotation_state = get_rotation_state(owner_id)
@@ -1893,7 +1925,40 @@ class AccountWorker:
         except UserDeactivatedError as e:
             await self._handle_account_disabled("frozen", e)
             raise RuntimeError("Аккаунт заморожен Telegram")
-        
+
+    async def send_reaction(
+        self,
+        chat_id: int,
+        reaction: str,
+        peer: Optional[Any] = None,
+        msg_id: Optional[int] = None,
+    ) -> None:
+        if msg_id is None:
+            raise RuntimeError("Неизвестно, к какому сообщению добавить реакцию")
+        client = await self._ensure_client()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Аккаунт не авторизован")
+        if peer is None:
+            try:
+                peer = await client.get_input_entity(chat_id)
+            except Exception:
+                peer = chat_id
+        try:
+            await client(
+                functions.messages.SendReactionRequest(
+                    peer=peer,
+                    msg_id=msg_id,
+                    reaction=[ReactionEmoji(reaction)],
+                    add_to_recent=True,
+                )
+            )
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise RuntimeError("Аккаунт заблокирован Telegram")
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise RuntimeError("Аккаунт заморожен Telegram")
+    
     async def block_contact(
         self,
         chat_id: int,
@@ -2839,15 +2904,100 @@ async def on_cb(ev):
         reply_waiting[admin_id] = {"ctx": ctx, "mode": mode}
         await ev.answer()
         ctx_info = reply_contexts[ctx]
-        hint_suffix = " (будет отправлено как reply)." if mode == "reply" else "."
         await show_interactive_message(
             admin_id,
-            (
-                f"Ответ для {ctx_info['phone']} (chat_id {ctx_info['chat_id']}): "
-                f"пришли текст сообщения{hint_suffix}\n"
-                "Или выбери шаблон ниже."
-            ),
+            build_reply_prompt(ctx_info, mode),
             buttons=build_reply_options_keyboard(ctx, mode),
+        )
+        return
+
+    if data.startswith("reply_reaction_menu:"):
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        _, ctx, mode = parts
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        if mode != "reply":
+            await ev.answer("Реакции доступны только для реплая", alert=True)
+            return
+        reply_waiting[admin_id] = {"ctx": ctx, "mode": mode}
+        await ev.answer()
+        await show_interactive_message(
+            admin_id,
+            "Выбери реакцию для сообщения:",
+            buttons=build_reaction_keyboard(ctx, mode),
+            replace=True,
+        )
+        return
+
+    if data.startswith("reply_reaction_back:"):
+        parts = data.split(":", 2)
+        if len(parts) != 3:
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        _, ctx, mode = parts
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        reply_waiting[admin_id] = {"ctx": ctx, "mode": mode}
+        await ev.answer()
+        await show_interactive_message(
+            admin_id,
+            build_reply_prompt(ctx_info, mode),
+            buttons=build_reply_options_keyboard(ctx, mode),
+            replace=True,
+        )
+        return
+
+    if data.startswith("reply_reaction:"):
+        parts = data.split(":", 3)
+        if len(parts) != 4:
+            await ev.answer("Некорректные данные", alert=True)
+            return
+        _, ctx, mode, encoded = parts
+        if mode != "reply":
+            await ev.answer("Реакции доступны только для реплая", alert=True)
+            return
+        try:
+            emoji = _decode_payload(encoded)
+        except Exception:
+            await ev.answer("Некорректная реакция", alert=True)
+            return
+        if emoji not in REACTION_EMOJI_SET:
+            await ev.answer("Реакция не поддерживается", alert=True)
+            return
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
+            await ev.answer("Контекст истёк", alert=True)
+            return
+        msg_id = ctx_info.get("msg_id")
+        if msg_id is None:
+            await ev.answer("Сообщение недоступно", alert=True)
+            return
+        worker = get_worker(admin_id, ctx_info["phone"])
+        if not worker:
+            await ev.answer("Аккаунт недоступен", alert=True)
+            return
+        try:
+            await worker.send_reaction(
+                ctx_info["chat_id"],
+                emoji,
+                ctx_info.get("peer"),
+                msg_id=msg_id,
+            )
+        except Exception as e:
+            await ev.answer(f"Ошибка реакции: {e}", alert=True)
+            return
+        reply_waiting[admin_id] = {"ctx": ctx, "mode": mode}
+        await ev.answer("Реакция отправлена")
+        await bot_client.send_message(
+            admin_id,
+            f"✅ Реакция {emoji} добавлена к сообщению собеседника.",
         )
         return
 
