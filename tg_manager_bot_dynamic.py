@@ -12,6 +12,7 @@ import re
 import shutil
 import socket
 import mimetypes
+from dataclasses import dataclass
 from datetime import datetime
 from collections import OrderedDict
 from logging.handlers import RotatingFileHandler
@@ -1277,6 +1278,18 @@ def recompute_account_proxy_meta(owner_id: int, phone: str, meta: Dict[str, Any]
     return changed, resolution
 
 # ---- worker ----
+
+
+@dataclass
+class _SendQueueItem:
+    future: asyncio.Future
+    chat_id: int
+    message: str
+    peer: Optional[Any]
+    reply_to_msg_id: Optional[int]
+    mark_read_msg_id: Optional[int]
+
+
 class AccountWorker:
     def __init__(self, owner_id: int, phone: str, api_id: int, api_hash: str, device: Dict[str,str], session_str: Optional[str]):
         self.owner_id = owner_id
@@ -1296,6 +1309,8 @@ class AccountWorker:
         self._proxy_override_signature: Optional[str] = None
         self._proxy_forced_off: bool = False
         self._proxy_force_reason: Optional[str] = None
+        self._send_queue: asyncio.Queue = asyncio.Queue()
+        self._send_worker_task: Optional[asyncio.Task] = None
 
     def _reset_session_state(self) -> None:
         with contextlib.suppress(FileNotFoundError):
@@ -1429,6 +1444,90 @@ class AccountWorker:
         with contextlib.suppress(Exception):
             await self.client.disconnect()
         self.client = None
+
+    def _ensure_send_worker(self) -> None:
+        if self._send_worker_task is None or self._send_worker_task.done():
+            self._send_worker_task = asyncio.create_task(self._send_queue_worker())
+
+    async def _send_queue_worker(self) -> None:
+        while True:
+            item = await self._send_queue.get()
+            if item is None:
+                self._send_queue.task_done()
+                break
+            if item.future.cancelled():
+                self._send_queue.task_done()
+                continue
+            try:
+                result = await self._send_outgoing_impl(
+                    chat_id=item.chat_id,
+                    message=item.message,
+                    peer=item.peer,
+                    reply_to_msg_id=item.reply_to_msg_id,
+                    mark_read_msg_id=item.mark_read_msg_id,
+                )
+            except Exception as exc:
+                if not item.future.done():
+                    item.future.set_exception(exc)
+            else:
+                if not item.future.done():
+                    item.future.set_result(result)
+            finally:
+                self._send_queue.task_done()
+
+    async def _shutdown_send_worker(self) -> None:
+        if self._send_worker_task is not None:
+            await self._send_queue.put(None)
+            try:
+                await self._send_worker_task
+            except asyncio.CancelledError:
+                pass
+            self._send_worker_task = None
+        while True:
+            try:
+                leftover = self._send_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            if leftover is None:
+                self._send_queue.task_done()
+                continue
+            if not leftover.future.done():
+                leftover.future.set_exception(
+                    RuntimeError("Отправка отменена: аккаунт остановлен")
+                )
+            self._send_queue.task_done()
+        self._send_queue = asyncio.Queue()
+
+    async def _send_outgoing_impl(
+        self,
+        *,
+        chat_id: int,
+        message: str,
+        peer: Optional[Any],
+        reply_to_msg_id: Optional[int],
+        mark_read_msg_id: Optional[int],
+    ):
+        client = await self._ensure_client()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Аккаунт не авторизован")
+        if peer is None:
+            try:
+                peer = await client.get_input_entity(chat_id)
+            except Exception:
+                peer = chat_id
+        await self._simulate_typing(client, peer, message)
+        try:
+            sent = await client.send_message(peer, message, reply_to=reply_to_msg_id)
+            if mark_read_msg_id is not None:
+                with contextlib.suppress(Exception):
+                    await client.send_read_acknowledge(peer, max_id=mark_read_msg_id)
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise RuntimeError("Аккаунт заблокирован Telegram")
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise RuntimeError("Аккаунт заморожен Telegram")
+        return sent
 
     def _select_proxy(self, *, force_new: bool = False) -> Optional[Tuple]:
         if self._proxy_forced_off:
@@ -1771,6 +1870,7 @@ class AccountWorker:
         if self._keepalive_task:
             self._keepalive_task.cancel()
             self._keepalive_task = None
+        await self._shutdown_send_worker()
         if self.client:
             try: await self.client.disconnect()
             except: pass
@@ -1886,27 +1986,20 @@ class AccountWorker:
         reply_to_msg_id: Optional[int] = None,
         mark_read_msg_id: Optional[int] = None,
     ):
-        client = await self._ensure_client()
-        if not await client.is_user_authorized():
-            raise RuntimeError("Аккаунт не авторизован")
-        if peer is None:
-            try:
-                peer = await client.get_input_entity(chat_id)
-            except Exception:
-                peer = chat_id
-        await self._simulate_typing(client, peer, message)
-        try:
-            sent = await client.send_message(peer, message, reply_to=reply_to_msg_id)
-            if mark_read_msg_id is not None:
-                with contextlib.suppress(Exception):
-                    await client.send_read_acknowledge(peer, max_id=mark_read_msg_id)
-        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
-            await self._handle_account_disabled("banned", e)
-            raise RuntimeError("Аккаунт заблокирован Telegram")
-        except UserDeactivatedError as e:
-            await self._handle_account_disabled("frozen", e)
-            raise RuntimeError("Аккаунт заморожен Telegram")
-        return sent
+        self._ensure_send_worker()
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future = loop.create_future()
+        await self._send_queue.put(
+            _SendQueueItem(
+                future=future,
+                chat_id=chat_id,
+                message=message,
+                peer=peer,
+                reply_to_msg_id=reply_to_msg_id,
+                mark_read_msg_id=mark_read_msg_id,
+            )
+        )
+        return await future
 
     async def send_voice(
         self,
