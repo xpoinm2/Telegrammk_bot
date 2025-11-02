@@ -56,10 +56,155 @@
     "rotation_state": {},
     "proxy": {}
   },
-  "1080551826": {
+  "7437723292": {
+    "role": "user",
+    "accounts": {
+      "+79893630517": {
+        "phone": "+79893630517",
+        "api_id": 29762521,
+        "device": "iPhone 12",
+        "session_file": "sessions\\7437723292\\+79893630517.session",
+        "proxy_override": {
+          "enabled": false
+        },
+        "proxy_desc": "None",
+        "proxy_dynamic": false,
+        "full_name": "Elizabeth"
+      }
+    },
+    "rotation_state": {
+      "api_idx": 0,
+      "dev_idx": 0
+    },
+    "proxy": {}
+  },
+  "7401285466": {
+    "role": "user",
+    "accounts": {
+      "+79250262265": {
+        "phone": "+79250262265",
+        "api_id": 29762521,
+        "device": "iPhone 12",
+        "session_file": "sessions\\7401285466\\+79250262265.session",
+        "proxy_override": {
+          "enabled": true,
+          "type": "SOCKS5",
+          "host": "5.101.33.212",
+          "port": 8000,
+          "rdns": true,
+          "username": "byyKSR",
+          "password": "BfK9ah",
+          "dynamic": false
+        },
+        "proxy_desc": "SOCKS5://5.101.33.212:8000",
+        "proxy_dynamic": false,
+        "full_name": "Авгусь ."
+      }
+    },
+    "rotation_state": {
+      "api_idx": 0,
+      "dev_idx": 0
+    },
+    "proxy": {}
+  },
+  "8147539366": {
+    "role": "user",
+    "accounts": {
+      "+79911414324": {
+        "phone": "+79911414324",
+        "api_id": 29762521,
+        "device": "iPhone 12",
+        "session_file": "sessions\\8147539366\\+79911414324.session",
+        "proxy_override": {
+          "enabled": false
+        },
+        "proxy_desc": "None",
+        "proxy_dynamic": false,
+        "full_name": "Милана"
+      }
+    },
+    "rotation_state": {
+      "api_idx": 0,
+      "dev_idx": 0
+    },
+    "proxy": {}
+  },
+  "7696240089": {
+    "role": "user",
+    "accounts": {
+      "+79240230950": {
+        "phone": "+79240230950",
+        "api_id": 29762521,
+        "device": "iPhone 12",
+        "session_file": "sessions\\7696240089\\+79240230950.session",
+        "proxy_override": {
+          "enabled": false
+        },
+        "proxy_desc": "None",
+        "proxy_dynamic": false,
+        "full_name": "Anesha"
+      }
+    },
+    "rotation_state": {
+      "api_idx": 0,
+      "dev_idx": 0
+    },
+    "proxy": {}
+  },
+  "7673652688": {
     "role": "user",
     "accounts": {},
     "rotation_state": {},
+    "proxy": {}
+  },
+  "7142578620": {
+    "role": "user",
+    "accounts": {},
+    "rotation_state": {},
+    "proxy": {}
+  },
+  "8005939794": {
+    "role": "user",
+    "accounts": {
+      "+79644616502": {
+        "phone": "+79644616502",
+        "api_id": 29762521,
+        "device": "iPhone 12",
+        "session_file": "sessions\\8005939794\\+79644616502.session",
+        "proxy_override": {
+          "enabled": false
+        },
+        "proxy_desc": "None",
+        "proxy_dynamic": false,
+        "full_name": "Алинка 👻"
+      }
+    },
+    "rotation_state": {
+      "api_idx": 0,
+      "dev_idx": 0
+    },
+    "proxy": {}
+  },
+  "7487512638": {
+    "role": "user",
+    "accounts": {
+      "+79056118726": {
+        "phone": "+79056118726",
+        "api_id": 20149796,
+        "device": "iPhone SE (2nd)",
+        "session_file": "sessions\\7487512638\\+79056118726.session",
+        "proxy_override": {
+          "enabled": false
+        },
+        "proxy_desc": "None",
+        "proxy_dynamic": false,
+        "full_name": "Andrey"
+      }
+    },
+    "rotation_state": {
+      "api_idx": 2,
+      "dev_idx": 2
+    },
     "proxy": {}
   }
 }
