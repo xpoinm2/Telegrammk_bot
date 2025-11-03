@@ -161,11 +161,13 @@ LIBRARY_DIR = "library"
 PASTES_DIR = os.path.join(LIBRARY_DIR, "pastes")
 VOICES_DIR = os.path.join(LIBRARY_DIR, "voices")
 VIDEO_DIR = os.path.join(LIBRARY_DIR, "video")
+STICKERS_DIR = os.path.join(LIBRARY_DIR, "stickers")
 PROXIES_DIR = os.path.join(LIBRARY_DIR, "proxies")
 TEXT_EXTENSIONS = {".txt", ".md"}
 VOICE_EXTENSIONS = {".ogg", ".oga", ".mp3"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".webm"}
-for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR, PROXIES_DIR):
+STICKER_EXTENSIONS = {".webp", ".tgs"}
+for _dir in (LIBRARY_DIR, PASTES_DIR, VOICES_DIR, VIDEO_DIR, STICKERS_DIR, PROXIES_DIR):
     os.makedirs(_dir, exist_ok=True)
 ARCHIVE_DIR = "Archive"
 os.makedirs(ARCHIVE_DIR, exist_ok=True)
@@ -244,7 +246,7 @@ def tenant_key(user_id: Any) -> str:
 def ensure_user_dirs(user_id: int) -> None:
     base = os.path.join(LIBRARY_DIR, str(user_id))
     os.makedirs(base, exist_ok=True)
-    for sub in ("pastes", "voices", "video"):
+    for sub in ("pastes", "voices", "video", "stickers"):
         os.makedirs(os.path.join(base, sub), exist_ok=True)
     os.makedirs(os.path.join(PROXIES_DIR, str(user_id)), exist_ok=True)
     os.makedirs(os.path.join(SESSIONS_DIR, str(user_id)), exist_ok=True)
@@ -740,10 +742,15 @@ def list_video_templates(owner_id: int) -> List[str]:
     return _list_user_and_shared_files(owner_id, "video", VIDEO_EXTENSIONS)
 
 
+def list_sticker_templates(owner_id: int) -> List[str]:
+    return _list_user_and_shared_files(owner_id, "stickers", STICKER_EXTENSIONS)
+
+
 FILE_TYPE_LABELS = {
     "paste": "Пасты",
     "voice": "Голосовые",
     "video": "Кружки",
+    "sticker": "Стикеры",
 }
 
 
@@ -754,6 +761,8 @@ def list_templates_by_type(owner_id: int, file_type: str) -> List[str]:
         return list_voice_templates(owner_id)
     if file_type == "video":
         return list_video_templates(owner_id)
+    if file_type == "sticker":
+        return list_sticker_templates(owner_id)
     return []
 
 
@@ -764,6 +773,8 @@ def user_library_subdir(owner_id: int, file_type: str) -> Optional[str]:
         return user_library_dir(owner_id, "voices")
     if file_type == "video":
         return user_library_dir(owner_id, "video")
+    if file_type == "sticker":
+        return user_library_dir(owner_id, "stickers")
     return None
 
 
@@ -789,6 +800,8 @@ def _allowed_template_directories(owner_id: int, file_type: str) -> List[str]:
         directories.append(VOICES_DIR)
     elif file_type == "video":
         directories.append(VIDEO_DIR)
+    elif file_type == "sticker":
+        directories.append(STICKERS_DIR)
     return directories
 
 
@@ -847,6 +860,7 @@ def build_reply_options_keyboard(ctx: str, mode: str) -> List[List[Button]]:
         ],
         [
             Button.inline("📹 Кружки", f"reply_video_menu:{ctx}:{mode}".encode()),
+            Button.inline("💟 Стикеры", f"reply_sticker_menu:{ctx}:{mode}".encode()),
         ],
     ]
     if mode == "reply":
@@ -1147,6 +1161,7 @@ def _resolve_media_filename(event: Any, media_code: str) -> str:
                 "photo": ".jpg",
                 "audio": ".mp3",
                 "gif": ".gif",
+                "sticker": ".webp",
             }
             ext = fallback_map.get(media_code, "")
         timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
@@ -2071,6 +2086,40 @@ class AccountWorker:
             raise RuntimeError("Аккаунт заморожен Telegram")
         return sent
 
+    async def send_sticker(
+        self,
+        chat_id: int,
+        file_path: str,
+        peer: Optional[Any] = None,
+        reply_to_msg_id: Optional[int] = None,
+        mark_read_msg_id: Optional[int] = None,
+    ):
+        client = await self._ensure_client()
+        if not await client.is_user_authorized():
+            raise RuntimeError("Аккаунт не авторизован")
+        if peer is None:
+            try:
+                peer = await client.get_input_entity(chat_id)
+            except Exception:
+                peer = chat_id
+        try:
+            sent = await client.send_file(
+                peer,
+                file_path,
+                reply_to=reply_to_msg_id,
+                supports_streaming=False,
+            )
+            if mark_read_msg_id is not None:
+                with contextlib.suppress(Exception):
+                    await client.send_read_acknowledge(peer, max_id=mark_read_msg_id)
+        except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
+            await self._handle_account_disabled("banned", e)
+            raise RuntimeError("Аккаунт заблокирован Telegram")
+        except UserDeactivatedError as e:
+            await self._handle_account_disabled("frozen", e)
+            raise RuntimeError("Аккаунт заморожен Telegram")
+        return sent
+    
     async def edit_message(
         self,
         chat_id: int,
@@ -2654,6 +2703,7 @@ def files_add_menu() -> List[List[Button]]:
         [Button.inline("📄 Пасты", b"files_paste")],
         [Button.inline("🎙 Голосовые", b"files_voice")],
         [Button.inline("📹 Кружки", b"files_video")],
+        [Button.inline("💟 Стикеры", b"files_sticker")],
         [Button.inline("⬅️ Назад", b"files_root")],
     ]
 
@@ -2663,6 +2713,7 @@ def files_delete_menu() -> List[List[Button]]:
         [Button.inline("📄 Пасты", b"files_delete_paste")],
         [Button.inline("🎙 Голосовые", b"files_delete_voice")],
         [Button.inline("📹 Кружки", b"files_delete_video")],
+        [Button.inline("💟 Стикеры", b"files_delete_sticker")],
         [Button.inline("⬅️ Назад", b"files_root")],
     ]
 
@@ -2923,6 +2974,12 @@ async def on_cb(ev):
         pending[admin_id] = {"flow": "file", "file_type": "video", "step": "name"}
         await answer_callback(ev)
         await bot_client.send_message(admin_id, "Введите название кружка:")
+        return
+
+    if data == "files_sticker":
+        pending[admin_id] = {"flow": "file", "file_type": "sticker", "step": "name"}
+        await answer_callback(ev)
+        await bot_client.send_message(admin_id, "Введите название стикера:")
         return
 
     if data.startswith("files_delete_"):
@@ -3393,7 +3450,14 @@ async def on_cb(ev):
             )
         return
 
-    if data.startswith(("reply_paste_menu:", "reply_voice_menu:", "reply_video_menu:")):
+    if data.startswith(
+        (
+            "reply_paste_menu:",
+            "reply_voice_menu:",
+            "reply_video_menu:",
+            "reply_sticker_menu:",
+        )
+    ):
         parts = data.split(":", 2)
         if len(parts) != 3:
             await answer_callback(ev, "Некорректные данные", alert=True)
@@ -3415,11 +3479,16 @@ async def on_cb(ev):
             empty_text = "Папка с голосовыми пуста"
             title = "🎙 Выбери голосовое сообщение:"
             prefix = "voice_send"
-        else:
+        elif data.startswith("reply_video_menu:"):
             files = list_video_templates(owner_for_ctx)
             empty_text = "Папка с кружками пуста"
             title = "📹 Выбери кружок для отправки:"
             prefix = "video_send"
+        else:
+            files = list_sticker_templates(owner_for_ctx)
+            empty_text = "Папка со стикерами пуста"
+            title = "💟 Выбери стикер для отправки:"
+            prefix = "sticker_send"
         if not files:
             await answer_callback(ev, empty_text, alert=True)
             return
@@ -3561,6 +3630,66 @@ async def on_cb(ev):
         await bot_client.send_message(
             admin_id,
             "✅ Голосовое сообщение отправлено собеседнику.",
+            buttons=buttons,
+        )
+        return
+
+    if data.startswith("sticker_send:"):
+        parts = data.split(":")
+        if len(parts) not in (3, 4):
+            await answer_callback(ev, "Некорректные данные", alert=True)
+            return
+        if len(parts) == 3:
+            _, ctx, idx_str = parts
+            mode = "normal"
+        else:
+            _, ctx, mode, idx_str = parts
+            if mode not in {"normal", "reply"}:
+                mode = "normal"
+        ctx_info = get_reply_context_for_admin(ctx, admin_id)
+        if not ctx_info:
+            await answer_callback(ev, "Контекст истёк", alert=True)
+            return
+        await mark_dialog_read_for_context(ctx_info)
+        try:
+            idx = int(idx_str)
+        except ValueError:
+            await answer_callback(ev, "Некорректный выбор", alert=True)
+            return
+        files = list_sticker_templates(admin_id)
+        if idx < 0 or idx >= len(files):
+            await answer_callback(ev, "Файл не найден", alert=True)
+            return
+        file_path = files[idx]
+        worker = get_worker(admin_id, ctx_info["phone"])
+        if not worker:
+            await answer_callback(ev, "Аккаунт недоступен", alert=True)
+            return
+        reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
+        try:
+            sent = await worker.send_sticker(
+                ctx_info["chat_id"],
+                file_path,
+                ctx_info.get("peer"),
+                reply_to_msg_id=reply_to_msg_id,
+                mark_read_msg_id=ctx_info.get("msg_id"),
+            )
+        except Exception as e:
+            await answer_callback(ev, f"Ошибка отправки: {e}", alert=True)
+            return
+        await answer_callback(ev, "✅ Стикер отправлен")
+        token = register_outgoing_action(
+            admin_id,
+            phone=ctx_info["phone"],
+            chat_id=ctx_info["chat_id"],
+            peer=ctx_info.get("peer"),
+            msg_id=_extract_message_id(sent),
+            message_type="sticker",
+        )
+        buttons = build_outgoing_control_buttons(token, allow_edit=False) if token else None
+        await bot_client.send_message(
+            admin_id,
+            "✅ Стикер отправлен собеседнику.",
             buttons=buttons,
         )
         return
@@ -3834,6 +3963,8 @@ async def on_text(ev):
                     )
                 elif file_type == "video":
                     await ev.reply("Пришлите кружок (видео-сообщение).")
+                elif file_type == "sticker":
+                    await ev.reply("Пришлите стикер (поддерживаются .webp и .tgs).")
                 else:
                     pending.pop(admin_id, None)
                     await ev.reply("Неизвестный тип файла. Операция отменена.")
@@ -3891,6 +4022,25 @@ async def on_text(ev):
                         return
                     pending.pop(admin_id, None)
                     await ev.reply(f"✅ Кружок сохранён как {os.path.basename(file_path)}")
+                    return
+
+                if file_type == "sticker":
+                    if not getattr(msg, "sticker", None):
+                        await ev.reply("Ожидается стикер (форматы .webp, .tgs).")
+                        return
+                    ext = ".webp"
+                    if msg.file and msg.file.ext:
+                        ext = msg.file.ext
+                    file_path = os.path.join(
+                        user_library_dir(admin_id, "stickers"), f"{name}{ext}"
+                    )
+                    try:
+                        await msg.download_media(file=file_path)
+                    except Exception as e:
+                        await ev.reply(f"Не удалось сохранить стикер: {e}")
+                        return
+                    pending.pop(admin_id, None)
+                    await ev.reply(f"✅ Стикер сохранён как {os.path.basename(file_path)}")
                     return
 
                 await ev.reply("Неизвестный тип файла. Операция отменена.")
