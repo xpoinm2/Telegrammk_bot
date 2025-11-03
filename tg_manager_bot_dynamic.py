@@ -1205,7 +1205,14 @@ async def safe_send_admin(
             _admin_reply_threads[admin_id][reply_context] = msg.id
 
 
-async def safe_send_admin_file(file_data: bytes, filename: str, *, owner_id: Optional[int] = None, **kwargs) -> None:
+async def safe_send_admin_file(
+    file_data: bytes,
+    filename: str,
+    *,
+    owner_id: Optional[int] = None,
+    reply_context: Optional[Any] = None,
+    **kwargs,
+) -> None:
     if not file_data:
         return
     targets = {owner_id} if owner_id is not None else all_admin_ids()
@@ -1213,7 +1220,18 @@ async def safe_send_admin_file(file_data: bytes, filename: str, *, owner_id: Opt
         try:
             bio = BytesIO(file_data)
             bio.name = filename
-            await bot_client.send_file(admin_id, bio, **kwargs)
+            send_kwargs = dict(kwargs)
+            if (
+                reply_context is not None
+                and "reply_to" not in send_kwargs
+                and "reply_to_msg_id" not in send_kwargs
+            ):
+                thread_map = _admin_reply_threads[admin_id]
+                reply_msg_id = thread_map.get(reply_context)
+                if reply_msg_id is not None:
+                    send_kwargs["reply_to"] = reply_msg_id
+
+            result = await bot_client.send_file(admin_id, bio, **send_kwargs)
         except Exception as e:
             logging.getLogger("mgrbot").warning(
                 "Cannot send file to admin %s yet (probably admin hasn't started the bot): %s",
@@ -1221,6 +1239,13 @@ async def safe_send_admin_file(file_data: bytes, filename: str, *, owner_id: Opt
                 e,
             )
             continue
+        if reply_context is not None:
+            if isinstance(result, (list, tuple)):
+                last_msg = result[-1] if result else None
+            else:
+                last_msg = result
+            if last_msg is not None and hasattr(last_msg, "id"):
+                _admin_reply_threads[admin_id][reply_context] = last_msg.id
 
 
 async def answer_callback(event: events.CallbackQuery.Event, *args, **kwargs):
@@ -1860,6 +1885,7 @@ class AccountWorker:
                     ],
                     [Button.inline("🚫 Заблокировать", f"block_contact:{ctx_id}".encode())],
                 ]
+                reply_context_key = (self.phone, ev.chat_id)
                 if media_bytes and media_filename:
                     media_caption_lines = [
                         f"👤 Аккаунт: <b>{html.escape(account_display)}</b>",
@@ -1873,6 +1899,7 @@ class AccountWorker:
                         media_bytes,
                         media_filename,
                         owner_id=self.owner_id,
+                        reply_context=reply_context_key,
                         caption="\n".join(media_caption_lines),
                         parse_mode="html",
                     )
