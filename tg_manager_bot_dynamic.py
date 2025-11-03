@@ -1214,6 +1214,145 @@ def _extract_reply_to_msg_id(ev: Any) -> Optional[int]:
 _admin_reply_threads: Dict[int, Dict[Any, int]] = defaultdict(dict)
 
 
+@dataclass
+class _NotificationThreadState:
+    message_id: int
+    thread_id: str
+    ctx_id: str
+    bullets: List[str]
+    header_lines: List[str]
+    history_html: str
+    history_collapsed: bool = True
+
+
+notification_threads: Dict[int, Dict[str, _NotificationThreadState]] = defaultdict(dict)
+
+MAX_NOTIFICATION_BULLETS = 20
+MAX_HISTORY_MESSAGES = 10
+
+
+def _make_thread_id(phone: str, chat_id: int) -> str:
+    return f"{phone}:{chat_id}"
+
+
+def _format_multiline_html(text: str) -> str:
+    escaped = html.escape(text.strip())
+    return escaped.replace("\n", "<br>")
+
+
+def _format_incoming_bullet(text: Optional[str], media_description: Optional[str]) -> str:
+    parts: List[str] = []
+    if text:
+        parts.append(_format_multiline_html(text))
+    if media_description:
+        parts.append(f"<i>{html.escape(media_description)}</i>")
+    if not parts:
+        parts.append("<i>Без текста</i>")
+    first = parts[0]
+    extras = parts[1:]
+    bullet = f"- {first}"
+    for extra in extras:
+        bullet += f"<br>&nbsp;&nbsp;{extra}"
+    return bullet
+
+
+def _format_history_entry(message: Message) -> str:
+    sender_label = "🧑‍💼 Вы" if message.out else "👥 Собеседник"
+    raw_text = (message.raw_text or "").strip()
+    if raw_text:
+        text_html = _format_multiline_html(raw_text)
+    else:
+        text_html = "<i>Без текста</i>"
+    entry = f"<b>{sender_label}:</b> {text_html}"
+    media_code, media_desc = _describe_media(message)
+    file_info: Optional[str] = None
+    if media_code:
+        file_obj = getattr(message, "file", None)
+        if message.out:
+            name = getattr(file_obj, "name", None)
+            if not name and media_code:
+                with contextlib.suppress(Exception):
+                    name = _resolve_media_filename(message, media_code)
+            mime_type = getattr(file_obj, "mime_type", None) or media_desc or media_code
+            if name:
+                file_info = f"📎 Файл: {html.escape(name)} ({html.escape(mime_type)})"
+            else:
+                file_info = f"📎 Файл: {html.escape(mime_type)}"
+        else:
+            label = media_desc or media_code
+            file_info = f"📎 Файл: {html.escape(label)}"
+    if file_info:
+        entry += f"<br>&nbsp;&nbsp;{file_info}"
+    return entry
+
+
+async def _build_history_html(client: TelegramClient, peer: Any, limit: int = MAX_HISTORY_MESSAGES) -> str:
+    try:
+        messages = await client.get_messages(peer, limit=limit)
+    except Exception as exc:
+        log.warning("Не удалось загрузить историю диалога: %s", exc)
+        return "<i>Не удалось загрузить историю</i>"
+    if not messages:
+        return "<i>История пуста</i>"
+    entries = [_format_history_entry(msg) for msg in reversed(messages)]
+    return "<br>".join(entries)
+
+
+def _build_notification_text(
+    header_lines: List[str],
+    bullet_lines: List[str],
+    history_html: str,
+    collapsed: bool,
+) -> str:
+    lines = list(header_lines)
+    lines.append("")
+    lines.append("Собеседник пишет:")
+    lines.extend(bullet_lines)
+    lines.append("")
+    if collapsed:
+        lines.append("⏵ История диалога (последние 10 сообщений)")
+    else:
+        lines.append("⏷ История диалога (последние 10 сообщений)")
+        if history_html:
+            lines.append(history_html)
+    return "\n".join(lines)
+
+
+def _build_notification_buttons(
+    ctx_id: str,
+    thread_id: str,
+    collapsed: bool,
+) -> List[List[Button]]:
+    rows: List[List[Button]] = [
+        [
+            Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
+            Button.inline("👀 Прочитать", f"mark_read:{ctx_id}".encode()),
+            Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
+        ],
+        [Button.inline("🚫 Заблокировать", f"block_contact:{ctx_id}".encode())],
+    ]
+    toggle_label = "⏵ История" if collapsed else "⏷ История"
+    toggle_state = "open" if collapsed else "close"
+    rows.append(
+        [
+            Button.inline(
+                toggle_label,
+                f"history_toggle:{thread_id}:{toggle_state}".encode(),
+            )
+        ]
+    )
+    return rows
+
+
+def clear_notification_thread(admin_id: int, thread_id: str) -> None:
+    threads = notification_threads.get(admin_id)
+    if not threads:
+        return
+    threads.pop(thread_id, None)
+    if not threads:
+        notification_threads.pop(admin_id, None)
+
+
 async def safe_send_admin(
     text: str,
     *,
@@ -1843,7 +1982,7 @@ class AccountWorker:
                 tag_value = f"@{sender_username}" if sender_username else "hidden"
                 sender_id_display = str(ev.sender_id) if ev.sender_id is not None else "unknown"
 
-                info_lines = [
+                header_lines = [
                     f"👤 Аккаунт: <b>{html.escape(account_display)}</b>",
                     f"👥 Собеседник: <b>{html.escape(sender_name) if sender_name else '—'}</b>",
                     f"🔗 {html.escape(tag_value)}",
@@ -1862,14 +2001,14 @@ class AccountWorker:
                             if len(preview) > 160:
                                 preview = preview[:157].rstrip() + "…"
                             reply_preview_html = html.escape(preview)
-                        info_lines.extend(
+                        header_lines.extend(
                             [
                                 "",
                                 f"↩️ Собеседник ответил на ваше сообщение (ID {reply_to_msg_id}).",
                             ]
                         )
                         if reply_preview_html:
-                            info_lines.append(f"📝 Цитата: {reply_preview_html}")
+                            header_lines.append(f"📝 Цитата: {reply_preview_html}")
                 media_bytes: Optional[bytes] = None
                 media_filename: Optional[str] = None
                 media_description: Optional[str] = None
@@ -1887,7 +2026,7 @@ class AccountWorker:
                     description_line = f"🗂 Вложение: <b>{html.escape(media_description)}</b>"
                     if size_display:
                         description_line += f" ({size_display})"
-                    info_lines.append(description_line)
+                    header_lines.append(description_line)
                 if has_media:
                     if media_size and media_size > MAX_MEDIA_FORWARD_SIZE:
                         formatted_limit = _format_filesize(MAX_MEDIA_FORWARD_SIZE)
@@ -1915,21 +2054,7 @@ class AccountWorker:
                         elif media_notice is None:
                             media_notice = "⚠️ Вложение не удалось скачать."
                 if media_notice:
-                    info_lines.extend(["", media_notice])
-                if txt:
-                    escaped_txt = html.escape(txt)
-                    info_lines.extend([
-                        "",
-                        "💬 <b>Сообщение:</b>",
-                        escaped_txt,
-                    ])
-                else:
-                    info_lines.extend([
-                        "",
-                        "💬 <b>Сообщение:</b>",
-                        "<i>Без текста</i>",
-                    ])
-                info_caption = "\n".join(info_lines)
+                    header_lines.extend(["", media_notice])
 
                 reply_contexts[ctx_id] = {
                     "owner_id": self.owner_id,
@@ -1939,15 +2064,94 @@ class AccountWorker:
                     "peer": peer,
                     "msg_id": ev.id,
                 }
-                buttons: List[List[Button]] = [
-                    [
-                        Button.inline("✉️ Ответить", f"reply:{ctx_id}".encode()),
-                        Button.inline("👀 Прочитать", f"mark_read:{ctx_id}".encode()),
-                        Button.inline("↩️ Реплай", f"reply_to:{ctx_id}".encode()),
-                    ],
-                    [Button.inline("🚫 Заблокировать", f"block_contact:{ctx_id}".encode())],
-                ]
                 reply_context_key = (self.phone, ev.chat_id)
+                thread_id = _make_thread_id(self.phone, ev.chat_id)
+                bullet_entry = _format_incoming_bullet(txt, media_description)
+                history_html = await _build_history_html(
+                    self.client, peer or ev.chat_id, limit=MAX_HISTORY_MESSAGES
+                )
+                header_snapshot = list(header_lines)
+                state_map = notification_threads.setdefault(self.owner_id, {})
+                state = state_map.get(thread_id)
+                if state:
+                    state.bullets.append(bullet_entry)
+                    if len(state.bullets) > MAX_NOTIFICATION_BULLETS:
+                        state.bullets = state.bullets[-MAX_NOTIFICATION_BULLETS:]
+                    state.ctx_id = ctx_id
+                    state.header_lines = header_snapshot
+                    state.history_html = history_html
+                    buttons = _build_notification_buttons(
+                        ctx_id, thread_id, state.history_collapsed
+                    )
+                    notification_text = _build_notification_text(
+                        state.header_lines,
+                        state.bullets,
+                        state.history_html,
+                        state.history_collapsed,
+                    )
+                    try:
+                        await bot_client.edit_message(
+                            self.owner_id,
+                            state.message_id,
+                            notification_text,
+                            buttons=buttons,
+                            parse_mode="html",
+                            link_preview=False,
+                        )
+                    except Exception as edit_error:
+                        log.warning(
+                            "[%s] не удалось обновить уведомление: %s",
+                            self.phone,
+                            edit_error,
+                        )
+                        state_map.pop(thread_id, None)
+                        await safe_send_admin(
+                            notification_text,
+                            buttons=buttons,
+                            parse_mode="html",
+                            link_preview=False,
+                            owner_id=self.owner_id,
+                            reply_context=reply_context_key,
+                        )
+                        msg_id = _admin_reply_threads[self.owner_id].get(reply_context_key)
+                        if msg_id is not None:
+                            state_map[thread_id] = _NotificationThreadState(
+                                message_id=msg_id,
+                                thread_id=thread_id,
+                                ctx_id=ctx_id,
+                                bullets=list(state.bullets),
+                                header_lines=header_snapshot,
+                                history_html=history_html,
+                                history_collapsed=state.history_collapsed,
+                            )
+                    else:
+                        state.header_lines = header_snapshot
+                        state.history_html = history_html
+                else:
+                    bullets = [bullet_entry]
+                    buttons = _build_notification_buttons(ctx_id, thread_id, True)
+                    notification_text = _build_notification_text(
+                        header_snapshot, bullets, history_html, True
+                    )
+                    await safe_send_admin(
+                        notification_text,
+                        buttons=buttons,
+                        parse_mode="html",
+                        link_preview=False,
+                        owner_id=self.owner_id,
+                        reply_context=reply_context_key,
+                    )
+                    msg_id = _admin_reply_threads[self.owner_id].get(reply_context_key)
+                    if msg_id is not None:
+                        state_map[thread_id] = _NotificationThreadState(
+                            message_id=msg_id,
+                            thread_id=thread_id,
+                            ctx_id=ctx_id,
+                            bullets=bullets,
+                            header_lines=header_snapshot,
+                            history_html=history_html,
+                            history_collapsed=True,
+                        )
                 if media_bytes and media_filename:
                     media_caption_lines = [
                         f"👤 Аккаунт: <b>{html.escape(account_display)}</b>",
@@ -1965,14 +2169,6 @@ class AccountWorker:
                         caption="\n".join(media_caption_lines),
                         parse_mode="html",
                     )
-                await safe_send_admin(
-                    info_caption,
-                    buttons=buttons,
-                    parse_mode="html",
-                    link_preview=False,
-                    owner_id=self.owner_id,
-                    reply_context=reply_context_key,
-                )
 
             await self.client.start()
         except AuthKeyDuplicatedError as e:
@@ -2946,6 +3142,47 @@ async def on_cb(ev):
         await answer_callback(ev)
         return
 
+    if data.startswith("history_toggle:"):
+        try:
+            _, thread_id, mode = data.split(":", 2)
+        except ValueError:
+            await answer_callback(ev, "Некорректные данные", alert=True)
+            return
+        state_map = notification_threads.get(admin_id)
+        if not state_map:
+            await answer_callback(ev, "История недоступна", alert=True)
+            return
+        state = state_map.get(thread_id)
+        if not state:
+            await answer_callback(ev, "История недоступна", alert=True)
+            return
+        if mode == "open":
+            collapsed = False
+        elif mode == "close":
+            collapsed = True
+        else:
+            await answer_callback(ev, "Некорректное состояние", alert=True)
+            return
+        buttons = _build_notification_buttons(state.ctx_id, thread_id, collapsed)
+        text = _build_notification_text(
+            state.header_lines,
+            state.bullets,
+            state.history_html,
+            collapsed,
+        )
+        try:
+            await ev.edit(text, buttons=buttons, parse_mode="html", link_preview=False)
+        except Exception as exc:
+            log.debug("Не удалось обновить историю уведомления: %s", exc)
+            state_map.pop(thread_id, None)
+            if not state_map:
+                notification_threads.pop(admin_id, None)
+            await answer_callback(ev, "Сообщение устарело", alert=True)
+            return
+        state.history_collapsed = collapsed
+        await answer_callback(ev)
+        return
+
     if data == "proxy_menu":
         await answer_callback(ev)
         await bot_client.send_message(
@@ -3361,6 +3598,14 @@ async def on_cb(ev):
                 for admin_key, waiting_ctx in list(reply_waiting.items()):
                     if waiting_ctx.get("ctx") == ctx_key:
                         reply_waiting.pop(admin_key, None)
+        threads = notification_threads.get(admin_id)
+        if threads:
+            prefix = f"{phone}:"
+            for thread_id in list(threads.keys()):
+                if thread_id.startswith(prefix):
+                    threads.pop(thread_id, None)
+            if not threads:
+                notification_threads.pop(admin_id, None)
         accounts = get_accounts_meta(admin_id)
         meta = accounts.pop(phone, None)
         persist_tenants()
@@ -3564,11 +3809,14 @@ async def on_cb(ev):
             )
         else:
             reply_contexts.pop(ctx, None)
+            clear_notification_thread(
+                admin_id, _make_thread_id(ctx_info["phone"], ctx_info["chat_id"])
+            )
             await bot_client.send_message(
                 admin_id,
                 "🚫 Собеседник заблокирован. Диалог удалён для обеих сторон.",
             )
-        return
+            return
 
     if data.startswith(
         (
@@ -3685,6 +3933,9 @@ async def on_cb(ev):
         buttons = (
             build_outgoing_control_buttons(token, allow_edit=True) if token else None
         )
+        clear_notification_thread(
+            admin_id, _make_thread_id(ctx_info["phone"], ctx_info["chat_id"])
+        )
         await answer_callback(ev, "✅ Паста отправлена")
         await bot_client.send_message(
             admin_id,
@@ -3748,6 +3999,9 @@ async def on_cb(ev):
         buttons = (
             build_outgoing_control_buttons(token, allow_edit=False) if token else None
         )
+        clear_notification_thread(
+            admin_id, _make_thread_id(ctx_info["phone"], ctx_info["chat_id"])
+        )
         await bot_client.send_message(
             admin_id,
             "✅ Голосовое сообщение отправлено собеседнику.",
@@ -3808,6 +4062,9 @@ async def on_cb(ev):
             message_type="sticker",
         )
         buttons = build_outgoing_control_buttons(token, allow_edit=False) if token else None
+        clear_notification_thread(
+            admin_id, _make_thread_id(ctx_info["phone"], ctx_info["chat_id"])
+        )
         await bot_client.send_message(
             admin_id,
             "✅ Стикер отправлен собеседнику.",
@@ -3869,6 +4126,9 @@ async def on_cb(ev):
         )
         buttons = (
             build_outgoing_control_buttons(token, allow_edit=False) if token else None
+        )
+        clear_notification_thread(
+            admin_id, _make_thread_id(ctx_info["phone"], ctx_info["chat_id"])
         )
         await bot_client.send_message(
             admin_id,
@@ -4057,6 +4317,9 @@ async def on_text(ev):
                 build_outgoing_control_buttons(token, allow_edit=True)
                 if token
                 else None
+            )
+            clear_notification_thread(
+                admin_id, _make_thread_id(ctx["phone"], ctx["chat_id"])
             )
             await ev.reply("✅ Сообщение отправлено.", buttons=buttons)
         except Exception as e:
