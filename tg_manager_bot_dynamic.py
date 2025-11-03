@@ -627,16 +627,30 @@ def _video_note_record_duration(file_path: Optional[str]) -> float:
 def _list_files(directory: str, allowed_ext: Set[str]) -> List[str]:
     if not os.path.isdir(directory):
         return []
-    files: List[str] = []
-    for name in sorted(os.listdir(directory)):
+
+    entries: List[Tuple[float, str, str]] = []
+    for name in os.listdir(directory):
         full = os.path.join(directory, name)
         if not os.path.isfile(full):
             continue
         ext = os.path.splitext(name)[1].lower()
         if allowed_ext and ext not in allowed_ext:
             continue
-        files.append(full)
-    return files
+        try:
+            mtime = os.path.getmtime(full)
+        except OSError:
+            mtime = 0.0
+        entries.append((mtime, name, full))
+
+    entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [full for _, _, full in entries]
+
+
+def _file_sort_key(path: str) -> Tuple[float, str]:
+    try:
+        return os.path.getmtime(path), os.path.basename(path)
+    except OSError:
+        return 0.0, os.path.basename(path)
 
 
 PAYLOAD_CACHE_LIMIT = 512
@@ -708,25 +722,32 @@ def _list_user_and_shared_files(owner_id: int, kind: str, allowed_ext: Set[str])
     Earlier versions of the bot stored assets directly in ``library/<kind>``.
     Newer builds keep user-specific copies in ``library/<user>/<kind>`` to avoid
     name collisions.  Some users still place their files in the legacy shared
-    folders manually, so we merge both locations to ensure compatibility.
-    Personal files always appear first, and duplicates (matched by full path)
-    are ignored when adding shared files.
+    folders manually, so we merge both locations to ensure compatibility.  The
+    combined result is deduplicated and sorted by the modification time so that
+    the most recently added items appear first.
     """
 
     personal_dir = user_library_dir(owner_id, kind)
     shared_dir = os.path.join(LIBRARY_DIR, kind)
 
-    files = _list_files(personal_dir, allowed_ext)
+    files: List[str] = []
+    seen: Set[str] = set()
+
+    def add_files(paths: List[str]) -> None:
+        for path in paths:
+            if path not in seen:
+                seen.add(path)
+                files.append(path)
+
+    add_files(_list_files(personal_dir, allowed_ext))
 
     # Avoid duplicates if personal_dir and shared_dir accidentally point to the
     # same location or contain identical files.  ``os.path.normpath`` is used to
     # compare directories on platforms with different path separators.
     if os.path.normpath(personal_dir) != os.path.normpath(shared_dir):
-        shared_files = _list_files(shared_dir, allowed_ext)
-        for path in shared_files:
-            if path not in files:
-                files.append(path)
+        add_files(_list_files(shared_dir, allowed_ext))
 
+    files.sort(key=_file_sort_key, reverse=True)
     return files
 
 
