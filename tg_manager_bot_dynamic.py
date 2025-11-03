@@ -30,7 +30,7 @@ try:  # Telethon <= 1.33.1
     from telethon.errors import QueryIdInvalidError  # type: ignore[attr-defined]
 except ImportError:  # Telethon >= 1.34 moved/renamed the error
     from telethon.errors.rpcerrorlist import QueryIdInvalidError  # type: ignore[attr-defined]
-from telethon.tl.types import ReactionEmoji
+from telethon.tl.types import ReactionEmoji, User
 from telethon.tl.custom import Message
 try:  # Telethon <= 1.33.1
     from telethon.errors import AuthKeyDuplicatedError  # type: ignore[attr-defined]
@@ -1742,6 +1742,15 @@ class AccountWorker:
                 sender_entity = None
                 with contextlib.suppress(Exception):
                     sender_entity = await ev.get_sender()
+                if not ev.is_private:
+                    return
+
+                if not isinstance(sender_entity, User):
+                    return
+
+                if getattr(sender_entity, "bot", False):
+                    return
+                
                 sender_name = get_display_name(sender_entity) if sender_entity else None
                 sender_username = getattr(sender_entity, "username", None) if sender_entity else None
                 tag_value = f"@{sender_username}" if sender_username else "hidden"
