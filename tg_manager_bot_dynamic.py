@@ -844,7 +844,7 @@ def build_asset_keyboard(
 
 
 def build_reply_prompt(ctx_info: Dict[str, Any], mode: str) -> str:
-    hint_suffix = " (будет отправлено как reply)." if mode == "reply" else "."
+    hint_suffix = " (будет отправлено как reply)." if ctx_info.get("msg_id") else "."
     return (
         f"Ответ для {ctx_info['phone']} (chat_id {ctx_info['chat_id']}): "
         f"пришли текст сообщения{hint_suffix}\n"
@@ -1168,6 +1168,26 @@ def _resolve_media_filename(event: Any, media_code: str) -> str:
         return f"{media_code or 'media'}_{timestamp}{ext}"
     timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
     return f"media_{timestamp}"
+
+
+def _collapse_whitespace(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _extract_reply_to_msg_id(ev: Any) -> Optional[int]:
+    message = getattr(ev, "message", ev)
+    reply_header = getattr(message, "reply_to", None) or getattr(ev, "reply_to", None)
+    if reply_header is not None:
+        reply_msg_id = getattr(reply_header, "reply_to_msg_id", None)
+        if isinstance(reply_msg_id, int):
+            return reply_msg_id
+    reply_msg_id = getattr(message, "reply_to_msg_id", None)
+    if isinstance(reply_msg_id, int):
+        return reply_msg_id
+    reply_msg_id = getattr(ev, "reply_to_msg_id", None)
+    if isinstance(reply_msg_id, int):
+        return reply_msg_id
+    return None
 
 
 _admin_reply_threads: Dict[int, Dict[Any, int]] = defaultdict(dict)
@@ -1808,6 +1828,27 @@ class AccountWorker:
                     f"🔗 {html.escape(tag_value)}",
                     f"ID Собеседника: {html.escape(sender_id_display)}",
                 ]
+                reply_to_msg_id = _extract_reply_to_msg_id(ev)
+                reply_preview_html: Optional[str] = None
+                if reply_to_msg_id is not None:
+                    reply_msg: Optional[Message] = None
+                    with contextlib.suppress(Exception):
+                        reply_msg = await ev.get_reply_message()
+                    if reply_msg and getattr(reply_msg, "out", False):
+                        preview_source = (reply_msg.raw_text or "").strip()
+                        if preview_source:
+                            preview = _collapse_whitespace(preview_source)
+                            if len(preview) > 160:
+                                preview = preview[:157].rstrip() + "…"
+                            reply_preview_html = html.escape(preview)
+                        info_lines.extend(
+                            [
+                                "",
+                                f"↩️ Собеседник ответил на ваше сообщение (ID {reply_to_msg_id}).",
+                            ]
+                        )
+                        if reply_preview_html:
+                            info_lines.append(f"📝 Цитата: {reply_preview_html}")
                 media_bytes: Optional[bytes] = None
                 media_filename: Optional[str] = None
                 media_description: Optional[str] = None
@@ -1903,7 +1944,6 @@ class AccountWorker:
                         caption="\n".join(media_caption_lines),
                         parse_mode="html",
                     )
-                reply_context_key = (self.phone, ev.chat_id)
                 await safe_send_admin(
                     info_caption,
                     buttons=buttons,
@@ -3601,6 +3641,7 @@ async def on_cb(ev):
             await answer_callback(ev, "Аккаунт недоступен", alert=True)
             return
         reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
+        reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
         try:
             sent = await worker.send_outgoing(
                 ctx_info["chat_id"],
@@ -3662,7 +3703,7 @@ async def on_cb(ev):
         if not worker:
             await answer_callback(ev, "Аккаунт недоступен", alert=True)
             return
-        reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
+        reply_to_msg_id = ctx_info.get("msg_id")
         try:
             sent = await worker.send_voice(
                 ctx_info["chat_id"],
@@ -3724,7 +3765,7 @@ async def on_cb(ev):
         if not worker:
             await answer_callback(ev, "Аккаунт недоступен", alert=True)
             return
-        reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
+        reply_to_msg_id = ctx_info.get("msg_id")
         try:
             sent = await worker.send_sticker(
                 ctx_info["chat_id"],
@@ -3784,7 +3825,7 @@ async def on_cb(ev):
         if not worker:
             await answer_callback(ev, "Аккаунт недоступен", alert=True)
             return
-        reply_to_msg_id = ctx_info.get("msg_id") if mode == "reply" else None
+        reply_to_msg_id = ctx_info.get("msg_id")
         try:
             sent = await worker.send_video_note(
                 ctx_info["chat_id"],
@@ -3974,7 +4015,7 @@ async def on_text(ev):
         if not worker:
             await ev.reply("Аккаунт недоступен.")
             return
-        reply_to_msg_id = ctx.get("msg_id") if waiting.get("mode") == "reply" else None
+        reply_to_msg_id = ctx.get("msg_id")
         try:
             sent = await worker.send_outgoing(
                 ctx["chat_id"],
