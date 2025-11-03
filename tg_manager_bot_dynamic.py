@@ -14,7 +14,7 @@ import socket
 import mimetypes
 from dataclasses import dataclass
 from datetime import datetime
-from collections import OrderedDict
+from collections import OrderedDict, defaultdict
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple, Set
 from io import BytesIO
@@ -1170,11 +1170,30 @@ def _resolve_media_filename(event: Any, media_code: str) -> str:
     return f"media_{timestamp}"
 
 
-async def safe_send_admin(text: str, *, owner_id: Optional[int] = None, **kwargs):
+_admin_reply_threads: Dict[int, Dict[Any, int]] = defaultdict(dict)
+
+
+async def safe_send_admin(
+    text: str,
+    *,
+    owner_id: Optional[int] = None,
+    reply_context: Optional[Any] = None,
+    **kwargs,
+):
     targets = {owner_id} if owner_id is not None else all_admin_ids()
     for admin_id in targets:
+        send_kwargs = dict(kwargs)
+        if (
+            reply_context is not None
+            and "reply_to" not in send_kwargs
+            and "reply_to_msg_id" not in send_kwargs
+        ):
+            thread_map = _admin_reply_threads[admin_id]
+            reply_msg_id = thread_map.get(reply_context)
+            if reply_msg_id is not None:
+                send_kwargs["reply_to"] = reply_msg_id
         try:
-            await bot_client.send_message(admin_id, text, **kwargs)
+            msg = await bot_client.send_message(admin_id, text, **send_kwargs)
         except Exception as e:
             logging.getLogger("mgrbot").warning(
                 "Cannot DM admin %s yet (probably admin hasn't started the bot): %s",
@@ -1182,6 +1201,8 @@ async def safe_send_admin(text: str, *, owner_id: Optional[int] = None, **kwargs
                 e,
             )
             continue
+        if reply_context is not None:
+            _admin_reply_threads[admin_id][reply_context] = msg.id
 
 
 async def safe_send_admin_file(file_data: bytes, filename: str, *, owner_id: Optional[int] = None, **kwargs) -> None:
@@ -1855,12 +1876,14 @@ class AccountWorker:
                         caption="\n".join(media_caption_lines),
                         parse_mode="html",
                     )
+                reply_context_key = (self.phone, ev.chat_id)
                 await safe_send_admin(
                     info_caption,
                     buttons=buttons,
                     parse_mode="html",
                     link_preview=False,
                     owner_id=self.owner_id,
+                    reply_context=reply_context_key,
                 )
 
             await self.client.start()
