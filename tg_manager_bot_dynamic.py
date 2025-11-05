@@ -18,7 +18,7 @@ from collections import OrderedDict, defaultdict
 from logging.handlers import RotatingFileHandler
 from typing import Dict, Optional, Any, List, Tuple, Set
 from io import BytesIO
-from telethon import TelegramClient, events, Button, functions, helpers
+from telethon import TelegramClient, events, Button, functions, helpers, types
 from telethon.utils import get_display_name
 from telethon.sessions import StringSession
 from telethon.errors import (
@@ -2211,7 +2211,7 @@ class AccountWorker:
         await self._ensure_client()
         await asyncio.sleep(_rand_delay(LOGIN_DELAY_SECONDS))
         try:
-            return await self.client.send_code_request(self.phone)
+            result = await self.client.send_code_request(self.phone)
         except (UserDeactivatedBanError, PhoneNumberBannedError) as e:
             await self._handle_account_disabled("banned", e)
             raise
@@ -2228,6 +2228,34 @@ class AccountWorker:
             log.warning("[%s] flood wait %ss on send_code", self.phone, wait)
             await asyncio.sleep(wait + 5)
             raise
+        if isinstance(result, types.auth.SentCode):
+            code_type = getattr(result, "type", None)
+            if isinstance(code_type, types.auth.SentCodeTypeApp):
+                try:
+                    forced = await self.client.send_code_request(self.phone, force_sms=True)
+                    log.info(
+                        "[%s] initial login code sent via app; retrying with SMS delivery",
+                        self.phone,
+                    )
+                except PhoneCodeFloodError as e:
+                    wait = getattr(e, "seconds", getattr(e, "value", 60))
+                    log.warning("[%s] phone code flood wait %ss", self.phone, wait)
+                    await asyncio.sleep(wait + 5)
+                    raise
+                except FloodWaitError as e:
+                    wait = getattr(e, "seconds", getattr(e, "value", 60))
+                    log.warning("[%s] flood wait %ss on send_code", self.phone, wait)
+                    await asyncio.sleep(wait + 5)
+                    raise
+                except Exception as force_err:
+                    log.warning(
+                        "[%s] unable to force SMS code delivery: %s",
+                        self.phone,
+                        force_err,
+                    )
+                else:
+                    result = forced
+        return result
 
     async def sign_in_code(self, code: str):
         await asyncio.sleep(_rand_delay(LOGIN_DELAY_SECONDS))
@@ -2998,7 +3026,6 @@ async def ensure_menu_keyboard(admin_id: int) -> None:
 
 def main_menu():
     return [
-        [Button.inline("🌐 Прокси", b"proxy_menu")],
         [Button.inline("➕ Добавить аккаунт", b"add")],
         [Button.inline("📋 Список аккаунтов", b"list")],
         [Button.inline("📁 Файлы", b"files")],
